@@ -3,7 +3,7 @@
 課堂分組系統：老師管理課程與名單，學生自行擔任組長並挑選組員，前台即時顯示分組現況。
 
 - 前端：原生 HTML / CSS / JavaScript（無框架）
-- 後端：Cloudflare Pages Functions + D1（SQLite）
+- 後端：Cloudflare Workers（static assets）+ D1（SQLite）
 - 資料共用：所有使用者連到同一個 D1 資料庫，任何人的異動其他人皆可看到（前台每 5 秒輪詢）
 
 ## 功能
@@ -33,17 +33,17 @@
 ## 架構
 
 ```
-index.html            外殼，掛載 #app
-js/script.js          前端全部邏輯（事件委派 + 每 5 秒輪詢）
-css/styles.css        樣式，支援 RWD
-functions/api/state.js   GET  /api/state   讀取全部課程／名單／分組
-functions/api/action.js  POST /api/action  所有異動，依角色驗證
-functions/api/_lib.js    共用工具：session、雜湊、遮蔽、逾時自動分配
+public/index.html     外殼，掛載 #app
+public/js/script.js   前端全部邏輯（事件委派 + 每 5 秒輪詢）
+public/css/styles.css 樣式，支援 RWD
+src/index.js          Worker 進入點：/api/* 走 D1，其餘回退靜態資源
+src/api.js            GET /api/state、POST /api/action
+src/lib.js            共用工具：session、雜湊、學號遮蔽、逾時自動分配
 schema.sql            D1 資料表
-wrangler.toml         Pages 設定與 D1 binding
+wrangler.toml         Worker 設定、assets 目錄、D1 binding
 ```
 
-## 部署（Cloudflare Pages）
+## 部署（Cloudflare Workers）
 
 1. 建立 D1 資料庫並套用 schema：
 
@@ -53,17 +53,23 @@ npx wrangler d1 execute groupstu --remote --file=schema.sql
 ```
 
 2. 把 `wrangler.toml` 內的 `database_id` 換成上一步輸出的 ID。
-3. Cloudflare Dashboard → Workers & Pages → Create → Pages → Connect to Git，
-   選擇本 repo，專案名稱 `groupstu`，Production branch `main`，
-   Framework preset **None**、Build command 留空、Build output directory `/`。
-   `wrangler.toml` 內的 D1 binding（`DB`）會自動套用。
+3. 部署：
+
+```bash
+npx wrangler deploy
+```
+
+線上網址：<https://groupstu.clare8628.workers.dev>
+
+要改成 push 後自動部署，可於 Cloudflare Dashboard →
+Workers & Pages → `groupstu` → Settings → Builds → Connect to Git，選擇本 repo 與 `main` 分支。
 
 ## 本機開發
 
 ```bash
 npx wrangler d1 execute groupstu --local --file=schema.sql
-npx wrangler pages dev
-# http://localhost:8788
+npx wrangler dev
+# http://localhost:8787
 ```
 
-> 注意：本版需要 Pages Functions 才能運作，直接開啟 `index.html` 或用靜態伺服器會無法讀取資料。
+> 注意：本版需要 Worker 才能運作，直接開啟 `public/index.html` 或用靜態伺服器會無法讀取資料。

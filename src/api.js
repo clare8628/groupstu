@@ -1,20 +1,18 @@
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
-  loadState, cap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq, publicize, resolveStudent,
-} from './_lib.js';
+  loadState, cap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
+  applyDeadline, publicize, resolveStudent,
+} from './lib.js';
 
-/* POST /api/action — 所有異動，依角色驗證 */
-export async function onRequestPost({ request, env }) {
-  const db = env.DB;
-  if (!db) return bad('D1 binding "DB" 未設定', 500);
-  try {
-    return await handle(request, env, db, await request.json());
-  } catch (err) {
-    return bad(String((err && err.message) || err), 500);
-  }
+/* GET /api/state — 公開讀取全部課程／名單／分組 */
+export async function handleState(request, env, db) {
+  const session = await readSession(db, env, request);
+  const courses = await applyDeadline(db, await loadState(db));
+  return json({ courses: await publicize(db, env, courses, session), session });
 }
 
-async function handle(request, env, db, body) {
+/* POST /api/action — 所有異動，依角色驗證 */
+export async function handleAction(request, env, db, body) {
   const action = body && body.action;
   if (!action) return bad('缺少 action');
   const session = await readSession(db, env, request);

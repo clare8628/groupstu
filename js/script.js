@@ -1,50 +1,78 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v1.2.0';   // 顯示於前台標題列
-const KEY = 'student_grouping_v2';
-const OLD_KEY = 'student_grouping_v1';
+const APP_VERSION = 'v2.0.0';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
-const newCourse = (year, subject) => ({
-  id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-  year: year || '', subject: subject || '',
-  groupSize: 4, tolerance: 1, deadline: '',
-  students: [], groups: [],
-});
+const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
+const POLL_MS = 5000;
 
-const defaultState = () => ({
-  teacherPassword: 'teacher123',
+let state = {
   courses: [],
-  currentId: null,      // 後台/前台目前檢視的課程
-  session: null,        // {role:'teacher'} | {role:'student', id, courseId}
-});
-
-let state = load();
+  session: null,
+  currentId: localStorage.getItem(CURRENT_KEY) || null,
+};
 let loginMode = null;   // 前台登入區：null | 'student' | 'teacher'
+let busy = false;
+let lastSig = '';
 
-function load() {
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (raw) {
-      const s = Object.assign(defaultState(), JSON.parse(raw));
-      if (!s.teacherPassword) s.teacherPassword = 'teacher123';
-      s.courses.forEach(c => c.students.forEach(x => delete x.email));
-      return s;
-    }
-    const old = JSON.parse(localStorage.getItem(OLD_KEY) || 'null');   // 舊版單一課程資料搬移
-    if (old && (old.students || []).length) {
-      const s = defaultState();
-      s.teacherPassword = old.teacherPassword || 'teacher123';
-      const c = Object.assign(newCourse(old.year, old.subject), {
-        groupSize: old.groupSize || 4, tolerance: old.tolerance || 1, deadline: old.deadline || '',
-        students: old.students.map(x => { delete x.email; return x; }), groups: old.groups || [],
-      });
-      s.courses = [c]; s.currentId = c.id;
-      return s;
-    }
-  } catch (e) { /* fallthrough */ }
-  return defaultState();
+/* ===== API ===== */
+async function apiGet() {
+  const r = await fetch('/api/state', { credentials: 'same-origin', headers: { 'cache-control': 'no-cache' } });
+  if (!r.ok) throw new Error('讀取資料失敗 (' + r.status + ')');
+  return r.json();
 }
-function save() { localStorage.setItem(KEY, JSON.stringify(state)); }
+
+async function apiPost(action, payload = {}) {
+  const r = await fetch('/api/action', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('操作失敗 (' + r.status + ')'));
+  return data;
+}
+
+/* 套用伺服器回傳的資料 */
+function apply(data) {
+  if (data.courses) state.courses = data.courses;
+  if (data.session !== undefined) state.session = data.session;
+  if (state.session && state.session.role === 'student') state.currentId = state.session.courseId;
+  if (!state.courses.some(c => c.id === state.currentId)) {
+    state.currentId = state.courses.length ? state.courses[0].id : null;
+  }
+  if (state.currentId) localStorage.setItem(CURRENT_KEY, state.currentId);
+  lastSig = JSON.stringify(data.courses || []);
+}
+
+/* 送出一個動作，成功後重繪 */
+async function act(action, payload = {}, opts = {}) {
+  if (busy) return null;
+  busy = true;
+  try {
+    const data = await apiPost(action, payload);
+    apply(data);
+    if (opts.after) opts.after(data);
+    render();
+    return data;
+  } catch (err) {
+    alert(err.message);
+    return null;
+  } finally {
+    busy = false;
+  }
+}
+
+/* 背景輪詢：其他人的異動會自動出現 */
+async function poll() {
+  if (busy || document.hidden) return;
+  try {
+    const data = await apiGet();
+    const sig = JSON.stringify(data.courses || []);
+    const sessionChanged = JSON.stringify(data.session || null) !== JSON.stringify(state.session || null);
+    if (sig !== lastSig || sessionChanged) { apply(data); render(); }
+  } catch (e) { /* 網路暫時失敗就略過這輪 */ }
+}
 
 /* ===== Course helpers ===== */
 const courseById = id => state.courses.find(c => c.id === id) || null;
@@ -64,12 +92,14 @@ const members = (c, gid) => c.students.filter(s => s.groupId === gid)
   .sort((a, b) => rank(a.s) - rank(b.s) || a.i - b.i)
   .map(x => x.s);
 const unassigned = c => c.students.filter(s => !s.groupId);
-const findStudent = (c, id) => c.students.find(s => s.id === id);
+const findStudent = (c, id) => c.students.find(s => s.id === id || s.ref === id);
+const keyOf = s => s.ref || s.id;   // 送給後端的識別碼
 const leaderOf = (c, gid) => members(c, gid).find(s => s.isLeader);
 function me() {
   const c = cur();
   return (c && state.session && state.session.role === 'student') ? findStudent(c, state.session.id) : null;
 }
+const teacherPasswordHint = '預設 teacher123，可於後台修改';
 
 function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
@@ -77,37 +107,6 @@ function shuffle(a) {
 }
 
 const deadlinePassed = c => !!c.deadline && Date.now() > new Date(c.deadline).getTime();
-
-/* 超過時限：未被挑選的學生自動隨機分配，並標示自動分組 */
-function checkDeadlines() {
-  state.courses.forEach(c => {
-    if (deadlinePassed(c) && c.groups.length && unassigned(c).length) autoAssign(c, true);
-  });
-}
-
-function autoAssign(c, markAuto) {
-  if (!c.groups.length) return;
-  shuffle(unassigned(c).slice()).forEach(s => {
-    const target = c.groups.slice().sort((a, b) => members(c, a.id).length - members(c, b.id).length)[0];
-    if (!target || members(c, target.id).length >= cap(c)) return;
-    s.groupId = target.id;
-    s.autoAssigned = !!markAuto;
-  });
-  save();
-}
-
-function makeGroups(c) {
-  const n = Math.max(1, Math.ceil(c.students.length / Math.max(1, c.groupSize)));
-  c.groups = Array.from({ length: n }, (_, i) => ({ id: 'g' + (i + 1), name: '第 ' + (i + 1) + ' 組' }));
-  c.students.forEach(s => { s.groupId = null; s.isLeader = false; s.isVice = false; s.autoAssigned = false; });
-  save();
-}
-
-function addGroup(c) {
-  const g = { id: 'g' + Date.now().toString(36), name: '第 ' + (c.groups.length + 1) + ' 組' };
-  c.groups.push(g);
-  return g;
-}
 
 /* ===== 前台分組現況 ===== */
 function publicBoard() {
@@ -266,7 +265,7 @@ function teacherNoCourse() {
   <div class="teacher-section">
     <h2>課程設定 Course setup</h2>
     <p class="file-path">建立新課程：填寫學年度與科目名稱後儲存，會出現在左側樹狀清單。</p>
-    ${courseForm(newCourse())}
+    ${courseForm({ year: '', subject: '', groupSize: 4, tolerance: 1, deadline: '' })}
   </div>`;
 }
 
@@ -353,16 +352,16 @@ function rosterTable(c) {
       <tr>
         <td>${esc(s.id)}</td>
         <td>${esc(s.name)}${s.autoAssigned ? ' <span class="tag-inline auto">自動</span>' : ''}${s.isVice ? ' <span class="tag-inline">副組長</span>' : ''}</td>
-        <td><select data-act="assign-student" data-id="${esc(s.id)}">${opts(s)}</select></td>
-        <td><input type="checkbox" data-act="set-leader" data-id="${esc(s.id)}" ${s.isLeader ? 'checked' : ''} ${s.groupId ? '' : 'disabled'}></td>
-        <td><button class="tab-btn" data-act="del-student" data-id="${esc(s.id)}">刪除</button></td>
+        <td><select data-act="assign-student" data-id="${esc(keyOf(s))}">${opts(s)}</select></td>
+        <td><input type="checkbox" data-act="set-leader" data-id="${esc(keyOf(s))}" ${s.isLeader ? 'checked' : ''} ${s.groupId ? '' : 'disabled'}></td>
+        <td><button class="tab-btn" data-act="del-student" data-id="${esc(keyOf(s))}">刪除</button></td>
       </tr>`).join('')}
     </tbody></table></div>`;
 }
 
 function studentScreen() {
   const c = cur(), s = me();
-  if (!c || !s) { state.session = null; save(); return authScreen(); }
+  if (!c || !s) { state.session = null; return authScreen(); }
   const g = c.groups.find(x => x.id === s.groupId);
   const mates = g ? members(c, g.id) : [];
   const closed = deadlinePassed(c);
@@ -393,7 +392,7 @@ function studentScreen() {
     html += `
     <h3 style="margin-top:1.5rem">挑選組員 Pick members（上限 ${cap(c)} 人，目前 ${mates.length}）</h3>
     <div class="pick-list">${pool.length ? pool.map(p => `
-      <label class="student"><input type="checkbox" data-act="pick" data-id="${esc(p.id)}"> ${esc(p.name)} (${esc(p.id)})</label>`).join('')
+      <label class="student"><input type="checkbox" data-act="pick" data-id="${esc(keyOf(p))}"> ${esc(p.name)} (${esc(p.id)})</label>`).join('')
         : '<p class="file-path">目前沒有未分組的學生 No unassigned students.</p>'}</div>
 
     <h3 style="margin-top:1.5rem">本組成員 My members <small>（可標記副組長 Mark a vice leader）</small></h3>
@@ -401,9 +400,9 @@ function studentScreen() {
       <div class="student ${m.isLeader ? 'leader' : ''} ${m.isVice ? 'vice-leader' : ''}">
         ${esc(m.name)} (${esc(m.id)})${m.isLeader ? ' — 組長' : m.isVice ? ' — 副組長' : ''}
         ${m.id !== s.id ? `
-          <button class="tab-btn ${m.isVice ? 'on' : ''}" data-act="toggle-vice" data-id="${esc(m.id)}">
+          <button class="tab-btn ${m.isVice ? 'on' : ''}" data-act="toggle-vice" data-id="${esc(keyOf(m))}">
             ${m.isVice ? '取消副組長' : '設為副組長'}</button>
-          <button class="tab-btn" data-act="drop" data-id="${esc(m.id)}">移出</button>` : ''}
+          <button class="tab-btn" data-act="drop" data-id="${esc(keyOf(m))}">移出</button>` : ''}
       </div>`).join('')}</div>
     <p class="file-path">每組僅能有一位副組長，重新指定會自動取代前一位。One vice leader per group.</p>`;
   }
@@ -412,7 +411,6 @@ function studentScreen() {
 
 /* ===== Render ===== */
 function render() {
-  checkDeadlines();
   const isFront = !state.session || state.session.role === 'student';
   const body = !state.session ? authScreen()
     : state.session.role === 'teacher' ? teacherScreen()
@@ -451,139 +449,138 @@ function download(content, type, filename) {
 /* 標題列（學號 / 姓名 / ID / Name）自動略過 */
 const isHeaderLine = line => /學號|學生證號|姓名|名字|student\s*(id|no)|^\s*id\b|\bname\b/i.test(line);
 
-function importText(c, text) {
-  let added = 0, skipped = 0;
-  text.replace(/^﻿/, '').split(/\r?\n/).map(l => l.trim()).filter(Boolean).forEach(line => {
+function parseRoster(text) {
+  const rows = [];
+  let skipped = 0;
+  text.replace(/^\ufeff/, '').split(/\r?\n/).map(l => l.trim()).filter(Boolean).forEach(line => {
     if (isHeaderLine(line)) { skipped++; return; }
     const [id, name] = line.split(/\s*[,\t|]\s*|\s+/).filter(Boolean);
-    if (!id || !name || findStudent(c, id)) return;
-    c.students.push({ id, name, groupId: null, isLeader: false, isVice: false, autoAssigned: false });
-    added++;
+    if (id && name) rows.push({ id, name });
   });
-  save(); render();
-  alert(`已匯入 ${added} 位學生${skipped ? `（略過標題列 ${skipped} 行）` : ''}\nImported ${added} students${skipped ? `, ${skipped} header line(s) skipped` : ''}`);
+  return { rows, skipped };
+}
+
+async function importText(c, text) {
+  const { rows, skipped } = parseRoster(text);
+  if (!rows.length) return alert('檔案沒有可匯入的資料 Nothing to import');
+  const res = await act('teacher:add-students', { courseId: c.id, students: rows });
+  if (!res) return;
+  const dup = rows.length - res.added;
+  alert(`已匯入 ${res.added} 位學生${skipped ? `（略過標題列 ${skipped} 行）` : ''}${dup > 0 ? `，${dup} 筆學號重複已略過` : ''}`);
 }
 
 /* ===== Event delegation ===== */
 const app = document.getElementById('app');
-const needCourse = () => { const c = cur(); if (!c) alert('請先於左側選擇或建立課程 Select a course first'); return c; };
+const needCourse = () => { const c = cur(); if (!c) { alert('請先於左側選擇或建立課程 Select a course first'); return null; } return c; };
 
 app.addEventListener('submit', e => {
-  const act = e.target.dataset.act;
-  if (!act) return;
+  const a = e.target.dataset.act;
+  if (!a) return;
   e.preventDefault();
   const f = e.target;
-  if (act === 'login-teacher') {
-    if (f.password.value !== state.teacherPassword) return alert('密碼錯誤 Wrong password');
-    state.session = { role: 'teacher' }; loginMode = null;
-  } else if (act === 'login-student') {
+
+  if (a === 'login-teacher') {
+    return act('login-teacher', { password: f.password.value }, { after: () => { loginMode = null; } });
+  }
+  if (a === 'login-student') {
     const c = cur();
     if (!c) return alert('請先選擇課程 Select a course');
-    const name = f.name.value.trim(), sid = f.sid.value.trim();
-    const s = c.students.find(x => x.name === name && x.id === sid);
-    if (!s) return alert('姓名或學號不正確，或不在本課程修課名單中\nName / student ID not found in this course');
-    state.session = { role: 'student', id: s.id, courseId: c.id }; loginMode = null;
-  } else if (act === 'change-password') {
-    if (f.current.value !== state.teacherPassword) return alert('目前密碼錯誤 Current password is wrong');
-    state.teacherPassword = f.next.value;
-    save(); render();
-    return alert('密碼已更新 Password updated');
-  } else if (act === 'save-course') {
-    const year = f.year.value.trim(), subject = f.subject.value.trim();
-    let c = cur();
-    if (!c) {
-      c = state.courses.find(x => x.year === year && x.subject === subject) || newCourse();
-      if (!state.courses.includes(c)) state.courses.push(c);
-      state.currentId = c.id;
-    }
-    c.year = year; c.subject = subject;
-    c.groupSize = Math.max(1, parseInt(f.groupSize.value) || 4);
-    c.tolerance = Math.max(0, parseInt(f.tolerance.value) || 0);
-    c.deadline = f.deadline.value;
-  } else if (act === 'add-student') {
-    const c = needCourse(); if (!c) return;
-    const id = f.id.value.trim(), name = f.name.value.trim();
-    if (findStudent(c, id)) return alert('學號已存在 Duplicate ID');
-    c.students.push({ id, name, groupId: null, isLeader: false, isVice: false, autoAssigned: false });
+    return act('login-student', { courseId: c.id, name: f.name.value.trim(), sid: f.sid.value.trim() },
+      { after: () => { loginMode = null; } });
   }
-  save(); render();
+  if (a === 'change-password') {
+    const next = f.next.value;
+    return act('teacher:change-password', { current: f.current.value, next },
+      { after: () => alert('密碼已更新 Password updated') });
+  }
+  if (a === 'save-course') {
+    const c = cur();
+    return act('teacher:save-course', {
+      id: c ? c.id : null,
+      year: f.year.value.trim(), subject: f.subject.value.trim(),
+      groupSize: Math.max(1, parseInt(f.groupSize.value) || 4),
+      tolerance: Math.max(0, parseInt(f.tolerance.value) || 0),
+      deadline: f.deadline.value,
+    }).then(data => {
+      if (data && data.courseId && data.courseId !== state.currentId) {
+        state.currentId = data.courseId;
+        localStorage.setItem(CURRENT_KEY, data.courseId);
+        render();
+      }
+    });
+  }
+  if (a === 'add-student') {
+    const c = needCourse(); if (!c) return;
+    return act('teacher:add-students', { courseId: c.id, students: [{ id: f.id.value.trim(), name: f.name.value.trim() }] });
+  }
 });
 
 app.addEventListener('click', e => {
   const btn = e.target.closest('[data-act]');
   if (!btn || btn.tagName === 'INPUT' || btn.tagName === 'SELECT' || btn.tagName === 'FORM') return;
-  const act = btn.dataset.act, id = btn.dataset.id;
+  const a = btn.dataset.act, id = btn.dataset.id;
   const c = cur();
-  if (act === 'logout') { state.session = null; loginMode = null; }
-  else if (act === 'show-teacher-login') { e.preventDefault(); loginMode = loginMode === 'teacher' ? null : 'teacher'; }
-  else if (act === 'show-student-login') { e.preventDefault(); loginMode = loginMode === 'student' ? null : 'student'; }
-  else if (act === 'close-login') { loginMode = null; }
-  else if (act === 'pick-course-node') { state.currentId = id; }
-  else if (act === 'new-course') { state.currentId = null; }
-  else if (act === 'del-course') {
-    const target = courseById(id);
-    if (!target || !confirm(`確定刪除「${courseLabel(target)}」及其名單與分組？`)) return;
-    state.courses = state.courses.filter(x => x.id !== id);
-    state.currentId = state.courses.length ? state.courses[0].id : null;
+
+  if (a === 'logout') return act('logout', {}, { after: () => { loginMode = null; } });
+  if (a === 'show-teacher-login') { e.preventDefault(); loginMode = loginMode === 'teacher' ? null : 'teacher'; return render(); }
+  if (a === 'show-student-login') { e.preventDefault(); loginMode = loginMode === 'student' ? null : 'student'; return render(); }
+  if (a === 'close-login') { loginMode = null; return render(); }
+  if (a === 'pick-course-node' || a === 'pick-course') {
+    state.currentId = id || btn.value;
+    localStorage.setItem(CURRENT_KEY, state.currentId);
+    return render();
   }
-  else if (act === 'del-student') { if (!c) return; c.students = c.students.filter(s => s.id !== id); }
-  else if (act === 'make-groups') {
+  if (a === 'new-course') { state.currentId = null; return render(); }
+
+  if (a === 'del-course') {
+    const target = state.courses.find(x => x.id === id);
+    if (!target || !confirm(`確定刪除「${courseLabel(target)}」及其名單與分組？`)) return;
+    return act('teacher:del-course', { courseId: id });
+  }
+  if (a === 'del-student') {
+    if (!c) return;
+    return act('teacher:del-student', { courseId: c.id, studentId: id });
+  }
+  if (a === 'make-groups') {
     if (!c) return;
     if (!c.students.length) return alert('請先匯入學生名單 Import roster first');
     if (!confirm('將重建組別並清空現有分組，確定？')) return;
-    makeGroups(c);
+    return act('teacher:make-groups', { courseId: c.id });
   }
-  else if (act === 'add-group') { if (!c) return; addGroup(c); }
-  else if (act === 'clear-groups') {
+  if (a === 'add-group') { if (!c) return; return act('teacher:add-group', { courseId: c.id }); }
+  if (a === 'clear-groups') {
     if (!c) return;
     if (!c.groups.length) return alert('本科目尚無分組 No groups to clear');
     if (!confirm(`確定清除「${courseLabel(c)}」的所有分組？學生名單會保留。`)) return;
-    c.groups = [];
-    c.students.forEach(x => { x.groupId = null; x.isLeader = false; x.isVice = false; x.autoAssigned = false; });
+    return act('teacher:clear-groups', { courseId: c.id });
   }
-  else if (act === 'auto-assign') {
+  if (a === 'auto-assign') {
     if (!c) return;
     if (!c.groups.length) return alert('請先建立組別 Create groups first');
-    autoAssign(c, true);
+    return act('teacher:auto-assign', { courseId: c.id });
   }
-  else if (act === 'export-json') { return c && exportJSON(c); }
-  else if (act === 'export-csv') { return c && exportCSV(c); }
-  else if (act === 'claim-leader') {
-    const s = me(); if (!s || !c) return;
-    if (!s.groupId) {                                   // 未分組：自行開一組
-      const empty = c.groups.find(g => !members(c, g.id).length) || addGroup(c);
-      s.groupId = empty.id;
-      s.autoAssigned = false;
-    }
-    if (leaderOf(c, s.groupId)) return alert('本組已有組長 This group already has a leader');
-    s.isLeader = true; s.isVice = false;
-  }
-  else if (act === 'unclaim-leader') { const s = me(); if (s) s.isLeader = false; }
-  else if (act === 'toggle-vice') {
-    const self = me(); if (!self || !self.isLeader || !c) return;
-    const target = findStudent(c, id);
-    if (!target || target.groupId !== self.groupId) return;
-    const wasVice = target.isVice;
-    members(c, self.groupId).forEach(m => { m.isVice = false; });   // 每組僅一位副組長
-    target.isVice = !wasVice;
-  }
-  else if (act === 'drop') {
-    if (!c) return;
-    const s = findStudent(c, id);
-    if (s) { s.groupId = null; s.isVice = false; s.autoAssigned = false; }
-  }
-  else return;
-  save(); render();
+  if (a === 'export-json') return c && exportJSON(c);
+  if (a === 'export-csv') return c && exportCSV(c);
+
+  if (a === 'claim-leader') return act('claim-leader');
+  if (a === 'unclaim-leader') return act('unclaim-leader');
+  if (a === 'toggle-vice') return act('toggle-vice', { studentId: id });
+  if (a === 'drop') return act('drop', { studentId: id });
 });
 
 app.addEventListener('change', e => {
   const t = e.target;
-  const act = t.dataset.act;
-  if (!act) return;
+  const a = t.dataset.act;
+  if (!a) return;
   const id = t.dataset.id;
   const c = cur();
-  if (act === 'pick-course') { state.currentId = t.value; save(); return render(); }
-  if (act === 'import-file') {
+
+  if (a === 'pick-course') {
+    state.currentId = t.value;
+    localStorage.setItem(CURRENT_KEY, state.currentId);
+    return render();
+  }
+  if (a === 'import-file') {
     if (!needCourse()) return;
     const file = t.files[0];
     if (!file) return;
@@ -592,36 +589,22 @@ app.addEventListener('change', e => {
     return r.readAsText(file);
   }
   if (!c) return;
-  if (act === 'assign-student') {
-    const s = findStudent(c, id);
-    if (!s) return;
-    if (t.value && members(c, t.value).length >= cap(c) && s.groupId !== t.value) { alert(`該組已達上限 ${cap(c)} 人`); }
-    else { s.groupId = t.value || null; s.autoAssigned = false; if (!t.value) { s.isLeader = false; s.isVice = false; } }
-  }
-  else if (act === 'set-leader') {
-    const s = findStudent(c, id);
-    if (!s || !s.groupId) return;
-    members(c, s.groupId).forEach(m => { if (m.id !== id) m.isLeader = false; });
-    s.isLeader = t.checked;
-    if (t.checked) s.isVice = false;
-  }
-  else if (act === 'pick') {
-    const self = me(), s = findStudent(c, id);
-    if (!self || !s) return;
-    if (members(c, self.groupId).length >= cap(c)) { alert(`本組已達上限 ${cap(c)} 人`); }
-    else { s.groupId = self.groupId; s.autoAssigned = false; }
-  }
-  else return;
-  save(); render();
+  if (a === 'assign-student') return act('teacher:assign-student', { courseId: c.id, studentId: id, groupId: t.value || null });
+  if (a === 'set-leader') return act('teacher:set-leader', { courseId: c.id, studentId: id, on: t.checked });
+  if (a === 'pick') return act('pick', { studentId: id });
 });
 
-/* 其他分頁更新時，前台即時同步 */
-window.addEventListener('storage', e => {
-  if (e.key !== KEY) return;
-  const session = state.session, currentId = state.currentId;
-  state = load();
-  state.session = session; state.currentId = currentId;
+/* ===== 啟動 ===== */
+(async function start() {
+  try {
+    apply(await apiGet());
+  } catch (err) {
+    document.getElementById('app').innerHTML =
+      `<div class="container"><div class="teacher-section"><h2>連線失敗 Connection error</h2>
+       <p class="file-path">${String(err.message)}　請重新整理頁面。</p></div></div>`;
+    return;
+  }
   render();
-});
-
-render();
+  setInterval(poll, POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+})();

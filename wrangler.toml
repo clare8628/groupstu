@@ -1,0 +1,8 @@
+name = "groupstu"
+compatibility_date = "2026-09-02"
+pages_build_output_dir = "."
+
+[[d1_databases]]
+binding = "DB"
+database_name = "groupstu"
+database_id = "8040c306-482b-4791-a991-48ea6ad4b43e"

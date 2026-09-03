@@ -109,7 +109,14 @@ function shuffle(a) {
 const deadlinePassed = c => !!c.deadline && Date.now() > new Date(c.deadline).getTime();
 
 /* ===== 前台分組現況 ===== */
-function publicBoard() {
+function unassignedList(c) {
+  const pool = unassigned(c);
+  return `<div class="pick-list">${pool.length
+    ? pool.map(s => `<div class="student">${esc(s.name)} (${esc(s.id)})</div>`).join('')
+    : '<p class="file-path">全部學生皆已分組 Everyone is assigned.</p>'}</div>`;
+}
+
+function publicBoard({ withUnassigned = true } = {}) {
   const c = cur();
   if (!c) return `<div class="board"><h2>分組現況 Group status</h2><p class="file-path">請先選擇課程。Select a course above.</p></div>`;
   const pool = unassigned(c);
@@ -133,10 +140,8 @@ function publicBoard() {
       </div>`;
     }).join('')}</div>` : '<p class="file-path">老師尚未建立組別，或由學生自行擔任組長開組。No groups yet.</p>'}
 
-    <h2 style="margin-top:2rem">未分組名單 Unassigned (${pool.length})</h2>
-    <div class="pick-list">${pool.length
-      ? pool.map(s => `<div class="student">${esc(s.name)} (${esc(s.id)})</div>`).join('')
-      : '<p class="file-path">全部學生皆已分組 Everyone is assigned.</p>'}</div>
+    ${withUnassigned ? `<h2 style="margin-top:2rem">未分組名單 Unassigned (${pool.length})</h2>
+    ${unassignedList(c)}` : ''}
   </div>`;
 }
 
@@ -293,21 +298,6 @@ function teacherCourse(c) {
   </div>
 
   <div class="teacher-section">
-    <h2>修課名單 Roster</h2>
-    <div class="form-group">
-      <label>匯入文字檔 Import .txt / .csv（每行：學號 姓名）</label>
-      <input type="file" accept=".txt,.csv" data-act="import-file">
-      <div class="file-path">格式範例 Format: <code>410123 王小明</code> 或 <code>410123,王小明</code>；標題列（學號 / 姓名）會自動略過。</div>
-    </div>
-    <form data-act="add-student" class="form-row">
-      <div class="form-group"><label>學號 ID</label><input name="id" required></div>
-      <div class="form-group"><label>姓名 Name</label><input name="name" required></div>
-      <div class="form-group full"><button class="btn btn-primary" type="submit">新增學生 Add student</button></div>
-    </form>
-    ${rosterTable(c)}
-  </div>
-
-  <div class="teacher-section">
     <h2>分組管理 Grouping</h2>
     <div class="stats">
       <div class="stat"><div class="value">${total}</div><div class="label">總學生數 Students</div></div>
@@ -325,7 +315,29 @@ function teacherCourse(c) {
     </div>
     ${c.deadline ? `<p class="file-path">時限 Deadline: ${esc(c.deadline.replace('T', ' '))} — ${deadlinePassed(c) ? '已截止（未選學生已自動分配）Closed' : '進行中 Open'}</p>` : ''}
   </div>
-  ${publicBoard()}`;
+
+  <div class="roster-row">
+    <div class="teacher-section">
+      <h2>修課名單 Roster</h2>
+      <div class="form-group">
+        <label>匯入文字檔 Import .txt / .csv（每行：學號 姓名）</label>
+        <input type="file" accept=".txt,.csv" data-act="import-file">
+        <div class="file-path">格式範例 Format: <code>410123 王小明</code> 或 <code>410123,王小明</code>；標題列（學號 / 姓名）會自動略過。</div>
+      </div>
+      <form data-act="add-student" class="form-row">
+        <div class="form-group"><label>學號 ID</label><input name="id" required></div>
+        <div class="form-group"><label>姓名 Name</label><input name="name" required></div>
+        <div class="form-group full"><button class="btn btn-primary" type="submit">新增學生 Add student</button></div>
+      </form>
+      ${rosterTable(c)}
+    </div>
+
+    <div class="teacher-section unassigned-panel">
+      <h2>未分組名單 Unassigned (${total - assigned})</h2>
+      ${unassignedList(c)}
+    </div>
+  </div>
+  ${publicBoard({ withUnassigned: false })}`;
 }
 
 function teacherPasswordBlock() {

@@ -201,3 +201,14 @@ nav .tabs { margin-left: 0; }
 .pick-list .student.leader { border-left: 3px solid #27ae60; font-weight: bold; color: #27ae60; }
 .pick-list .student.vice-leader { border-left: 3px solid #f39c12; }
 h3 small { font-size: .75rem; font-weight: normal; color: #888; }
+
+/* ===== 後台：修課名單 + 未分組名單 並排 ===== */
+.roster-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); gap: 1.5rem; align-items: start; }
+.roster-row > .teacher-section { margin-top: 2rem; }
+.unassigned-panel h2 { margin-bottom: 1rem; font-size: 1.15rem; }
+.unassigned-panel .pick-list { grid-template-columns: 1fr; max-height: 460px; overflow-y: auto; }
+
+@media (max-width: 1024px) {
+  .roster-row { grid-template-columns: 1fr; }
+  .unassigned-panel .pick-list { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); max-height: none; }
+}

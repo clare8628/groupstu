@@ -11,6 +11,7 @@ let state = {
   currentId: localStorage.getItem(CURRENT_KEY) || null,
 };
 let loginMode = null;   // 前台登入區：null | 'student' | 'teacher'
+let teacherView = 'course';   // 後台主區：'course' | 'settings'
 let busy = false;
 let lastSig = '';
 
@@ -183,7 +184,7 @@ function loginCard() {
   if (loginMode === 'teacher') {
     return `<div class="login-bar teacher" id="login">
       <form data-act="login-teacher" class="inline-form">
-        <div class="form-group"><label>老師密碼 Teacher password</label><input type="password" name="password" required autocomplete="off"></div>
+        <div class="form-group pw"><label>老師密碼 Teacher password</label><input type="password" name="password" required autocomplete="off"></div>
         <button class="btn btn-secondary" type="submit">老師登入 Teacher login</button>
         <button class="tab-btn close" type="button" data-act="close-login" title="關閉 Close">✕</button>
       </form>
@@ -257,12 +258,23 @@ function courseTree() {
           </li>`).join('')}</ul>
       </div>`).join('') : '<p class="file-path">尚無課程，請於右側「課程設定」建立。</p>'}
     <button class="btn btn-secondary" data-act="new-course">＋ 新增課程 New course</button>
+    <div class="tree-year tree-sys">
+      <div class="tree-year-label">系統設定 System</div>
+      <ul>
+        <li class="${teacherView === 'settings' ? 'active' : ''}">
+          <button data-act="sys-password">更改管理者密碼<span class="count">Change admin password</span></button>
+        </li>
+      </ul>
+    </div>
   </aside>`;
 }
 
 function teacherScreen() {
   const c = cur();
-  return `<div class="layout">${courseTree()}<main>${c ? teacherCourse(c) : teacherNoCourse()}${teacherPasswordBlock()}</main></div>`;
+  const main = teacherView === 'settings'
+    ? teacherPasswordBlock()
+    : (c ? teacherCourse(c) : teacherNoCourse());
+  return `<div class="layout">${courseTree()}<main>${main}</main></div>`;
 }
 
 function teacherNoCourse() {
@@ -343,11 +355,11 @@ function teacherCourse(c) {
 function teacherPasswordBlock() {
   return `
   <div class="teacher-section">
-    <h2>登入密碼 Teacher password</h2>
-    <form data-act="change-password" class="form-row">
+    <h2>更改管理者密碼 <small>Change admin password</small></h2>
+    <form data-act="change-password" class="pw-form">
       <div class="form-group"><label>目前密碼 Current</label><input type="password" name="current" required autocomplete="off"></div>
-      <div class="form-group"><label>新密碼 New</label><input type="password" name="next" required minlength="4" autocomplete="off"></div>
-      <div class="form-group full"><button class="btn btn-primary" type="submit">更新密碼 Update password</button></div>
+      <div class="form-group"><label>新密碼 New（至少 4 碼）</label><input type="password" name="next" required minlength="4" autocomplete="off"></div>
+      <button class="btn btn-primary" type="submit">更新密碼 Update password</button>
     </form>
     <p class="file-path">學生登入固定為「姓名 + 學號」，不需另設密碼。Students sign in with name + student ID.</p>
   </div>`;
@@ -533,16 +545,18 @@ app.addEventListener('click', e => {
   const a = btn.dataset.act, id = btn.dataset.id;
   const c = cur();
 
-  if (a === 'logout') return act('logout', {}, { after: () => { loginMode = null; } });
+  if (a === 'logout') return act('logout', {}, { after: () => { loginMode = null; teacherView = 'course'; } });
   if (a === 'show-teacher-login') { e.preventDefault(); loginMode = loginMode === 'teacher' ? null : 'teacher'; return render(); }
   if (a === 'show-student-login') { e.preventDefault(); loginMode = loginMode === 'student' ? null : 'student'; return render(); }
   if (a === 'close-login') { loginMode = null; return render(); }
+  if (a === 'sys-password') { teacherView = 'settings'; return render(); }
   if (a === 'pick-course-node' || a === 'pick-course') {
     state.currentId = id || btn.value;
+    teacherView = 'course';
     localStorage.setItem(CURRENT_KEY, state.currentId);
     return render();
   }
-  if (a === 'new-course') { state.currentId = null; return render(); }
+  if (a === 'new-course') { state.currentId = null; teacherView = 'course'; return render(); }
 
   if (a === 'del-course') {
     const target = state.courses.find(x => x.id === id);

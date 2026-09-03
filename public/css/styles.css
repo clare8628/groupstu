@@ -206,9 +206,28 @@ h3 small { font-size: .75rem; font-weight: normal; color: #888; }
 .roster-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 320px); gap: 1.5rem; align-items: start; }
 .roster-row > .teacher-section { margin-top: 2rem; }
 .unassigned-panel h2 { margin-bottom: 1rem; font-size: 1.15rem; }
-.unassigned-panel .pick-list { grid-template-columns: 1fr; max-height: 460px; overflow-y: auto; }
+.unassigned-panel .pick-list { grid-template-columns: 1fr; }
 
 @media (max-width: 1024px) {
   .roster-row { grid-template-columns: 1fr; }
-  .unassigned-panel .pick-list { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); max-height: none; }
+  .unassigned-panel .pick-list { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+}
+
+/* ===== 密碼欄位寬度：密碼不長，不需滿版 ===== */
+.inline-form .form-group.pw { flex: 0 0 200px; min-width: 0; }
+.inline-form .form-group.pw input { width: 100%; }
+
+.pw-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .75rem; }
+.pw-form .form-group { margin-bottom: 0; }
+.pw-form .form-group label { font-size: .8rem; margin-bottom: .25rem; }
+.pw-form input { width: 200px; max-width: 100%; }
+.pw-form .btn { padding: .5rem 1.25rem; font-size: .9rem; }
+
+/* ===== 後台左樹：系統設定 ===== */
+.tree-sys { margin-top: 1.25rem; padding-top: .75rem; border-top: 1px solid #f0f0f0; }
+
+@media (max-width: 600px) {
+  .inline-form .form-group.pw { flex: 1 1 100%; }
+  .pw-form .form-group { flex: 1 1 100%; }
+  .pw-form input { width: 100%; }
 }

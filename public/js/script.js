@@ -285,12 +285,12 @@ function publicBoard({ withUnassigned = true } = {}) {
             ${g.editDeadline ? `<span style="font-size:0.75rem;opacity:0.9;">（截止：${esc(g.editDeadline.replace('T', ' '))}）</span>` : ''}
           </div>` : ''}
         <div class="students">${list.length ? list.map(s => {
-          const adj = calcAdjustment(c, g, s);
+          // 期末組長評分僅老師看得到分數，一般同學看不到組長的給分
           return `<div class="student ${s.isLeader ? 'leader' : ''} ${s.isVice ? 'vice-leader' : ''}">
             <span class="student-info-col">
               ${esc(s.name)} (${esc(s.id)})${s.isLeader ? ' — 組長' : s.isVice ? ' — 副組長' : ''}${s.autoAssigned ? ' <span class="tag-inline auto">自動</span>' : ''}
             </span>
-            ${scoreBadge(adj)}
+            ${isTeacher ? scoreBadge(calcAdjustment(c, g, s)) : ''}
           </div>`;
         }).join('') : '<div class="student">（尚無成員 Empty）</div>'}</div>
         ${isTeacher ? `
@@ -432,12 +432,7 @@ function courseSelectionBlock() {
 }
 
 function bulletinBlock(c) {
-  const notice = (c && c.notice) ? c.notice : `【期末考成績加減分與評分規定】：
-1. 當老師開放組長評分權限時，組長可依據組員之貢獻或配合程度於期末時給予加分 (0 ~ 10 分)。
-2. 組長在老師開放評分權限時進行評分，組長自己可獲得 10 分的加分。
-3. 超過分組截止時間由系統自動分組造成沒有組長的組別，每位成員期末考成績扣 10 分。`;
-
-  const timeStr = (c && c.noticeTime) ? esc(c.noticeTime) : '';
+  const notices = (c && Array.isArray(c.notices)) ? c.notices : [];
 
   return `
   <section class="block-section bulletin-section" id="bulletin-block">
@@ -446,11 +441,14 @@ function bulletinBlock(c) {
       <div class="bulletin-title-wrap">
         <h2>分組注意事項與評分規定</h2>
         ${c ? `<span class="bulletin-course-pill">${esc(courseLabel(c))}</span>` : ''}
-        ${timeStr ? `<span class="bulletin-time-tag">🕒 發布時間：${timeStr}</span>` : ''}
       </div>
     </div>
-    <div class="bulletin-body">
-      ${esc(notice).replace(/\n/g, '<br>')}
+    <div class="bulletin-list">
+      ${notices.length ? notices.map(n => `
+        <div class="bulletin-item">
+          <div class="bulletin-item-content">${esc(n.content).replace(/\n/g, '<br>')}</div>
+          ${n.time ? `<div class="bulletin-item-time">🕒 ${esc(n.time)}</div>` : ''}
+        </div>`).join('') : '<p class="file-path">目前尚無公告。No announcements yet.</p>'}
     </div>
   </section>`;
 }
@@ -615,24 +613,41 @@ function teacherNoCourse() {
 }
 
 function courseForm(c) {
-  const noticeVal = (c && c.notice !== undefined && c.notice !== null) ? c.notice : `【期末考成績加減分與評分規定】：
-1. 當老師開放組長評分權限時，組長可依據組員之貢獻或配合程度於期末時給予加分 (0 ~ 10 分)。
-2. 組長在老師開放評分權限時進行評分，組長自己可獲得 10 分的加分。
-3. 超過分組截止時間由系統自動分組造成沒有組長的組別，每位成員期末考成績扣 10 分。`;
-
   return `<form data-act="save-course">
     <div class="form-row">
       <div class="form-group"><label>學年度 Academic year</label><input name="year" value="${esc(c.year)}" placeholder="114-1" required></div>
       <div class="form-group"><label>科目名稱 Subject</label><input name="subject" value="${esc(c.subject)}" placeholder="資料結構" required></div>
       <div class="form-group"><label>每組人數 Group size</label><input type="number" min="1" name="groupSize" value="${c.groupSize}"></div>
       <div class="form-group"><label>誤差人數 ± Tolerance</label><input type="number" min="0" name="tolerance" value="${c.tolerance}"></div>
-      <div class="form-group full">
-        <label>公布欄注意事項 Notice (顯示於前台最上方)</label>
-        <textarea name="notice" rows="4" style="width:100%;padding:0.6rem;border:1px solid #ddd;border-radius:4px;font:inherit;">${esc(noticeVal)}</textarea>
-      </div>
     </div>
     <button class="btn btn-primary" type="submit">儲存 Save</button>
   </form>`;
+}
+
+/* ---- 後台：公佈欄管理（每則公告獨立發布，各自附帶時間） ---- */
+function bulletinAdminBlock(c) {
+  const notices = Array.isArray(c.notices) ? c.notices : [];
+  return `
+  <div class="teacher-section">
+    <h2>公佈欄管理 <small>Bulletin management (顯示於前台最上方)</small></h2>
+    <form data-act="add-notice" class="form-row">
+      <div class="form-group full">
+        <label>發布新公告 New announcement</label>
+        <textarea name="content" rows="3" style="width:100%;padding:0.6rem;border:1px solid #ddd;border-radius:4px;font:inherit;" placeholder="輸入公告內容，發布後將附上目前時間顯示於公佈欄最右側" required></textarea>
+      </div>
+      <div class="form-group full"><button class="btn btn-primary" type="submit">📢 發布公告 Publish</button></div>
+    </form>
+    <div class="bulletin-admin-list" style="margin-top:0.75rem">
+      ${notices.length ? notices.map(n => `
+        <div class="bulletin-admin-item">
+          <div class="bulletin-item-content">${esc(n.content).replace(/\n/g, '<br>')}</div>
+          <div class="bulletin-admin-item-side">
+            ${n.time ? `<span class="bulletin-item-time">🕒 ${esc(n.time)}</span>` : ''}
+            <button class="tab-btn" data-act="del-notice" data-id="${esc(n.id)}">刪除</button>
+          </div>
+        </div>`).join('') : '<p class="file-path">目前尚無公告，請於上方發布第一則。</p>'}
+    </div>
+  </div>`;
 }
 
 /* ---- 後台：學期成績加減分與組長評分控制面板 ---- */
@@ -706,6 +721,150 @@ function teacherPeerEvalBlock(c) {
   </div>`;
 }
 
+/* ---- 後台：分組異動日誌管理 ---- */
+function logActionBadge(action) {
+  if (action === 'pick') return '<span class="log-badge log-badge-pick">➕ 加入組員</span>';
+  if (action === 'drop') return '<span class="log-badge log-badge-drop">➖ 釋出組員</span>';
+  if (action === 'claim-leader' || action === 'unclaim-leader') return '<span class="log-badge log-badge-leader">👑 組長變更</span>';
+  if (action === 'toggle-vice' || action === 'vice') return '<span class="log-badge log-badge-vice">⭐ 副組長變更</span>';
+  if (action === 'submit-peer-eval' || action === 'peer-eval') return '<span class="log-badge log-badge-eval">📝 期末評分</span>';
+  if (action && (action.startsWith('teacher') || action === 'clear-groups' || action === 'del-groups' || action === 'auto-assign')) {
+    return '<span class="log-badge log-badge-teacher">⚙️ 老師操作</span>';
+  }
+  return `<span class="log-badge log-badge-default">${esc(action || '其他')}</span>`;
+}
+
+function activityLogsBlock(c) {
+  const logs = Array.isArray(c.logs) ? c.logs : [];
+  return `
+  <div class="teacher-section activity-logs-section">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:0.75rem;">
+      <div style="display:flex;align-items:baseline;gap:0.5rem;flex-wrap:wrap;">
+        <h2 style="margin:0;">📋 分組異動日誌 <small>Activity Log</small></h2>
+        <span class="log-count-pill" id="log-count-display">共 ${logs.length} 筆紀錄</span>
+      </div>
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+        <button class="btn btn-secondary" style="padding:0.4rem 0.9rem;font-size:0.85rem;margin:0;" data-act="export-logs-csv" title="匯出異動日誌為 CSV 檔">
+          📥 匯出日誌 CSV
+        </button>
+        ${logs.length ? `
+          <button class="btn btn-danger" style="padding:0.4rem 0.9rem;font-size:0.85rem;margin:0;" data-act="clear-course-logs" title="清空本科目所有異動紀錄">
+            🗑️ 清空日誌
+          </button>
+        ` : ''}
+      </div>
+    </div>
+    <p class="file-path" style="margin:0 0 0.85rem 0;">
+      系統即時記錄組長挑選／釋出組員、登記／取消組長身分與老師分組調整之詳細操作。可透過關鍵字搜尋或動作類別進行篩選。
+    </p>
+
+    <!-- 篩選與搜尋工具列 -->
+    <div class="log-toolbar">
+      <div style="display:flex;align-items:center;gap:0.4rem;flex:1;min-width:220px;">
+        <span style="font-size:0.9rem;color:#64748b;">🔍 搜尋:</span>
+        <input type="text" id="log-search-input" placeholder="輸入學號、姓名或組別關鍵字..." style="width:100%;padding:0.35rem 0.65rem;font-size:0.88rem;">
+      </div>
+      <div style="display:flex;align-items:center;gap:0.4rem;">
+        <span style="font-size:0.9rem;color:#64748b;white-space:nowrap;">🏷️ 動作類別:</span>
+        <select id="log-filter-action" style="padding:0.35rem 0.65rem;font-size:0.88rem;">
+          <option value="">全部動作 All</option>
+          <option value="pick">➕ 加入組員</option>
+          <option value="drop">➖ 釋出組員</option>
+          <option value="leader">👑 組長變更</option>
+          <option value="vice">⭐ 副組長變更</option>
+          <option value="eval">📝 期末評分</option>
+          <option value="teacher">⚙️ 老師操作</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- 日誌表格 -->
+    <div class="table-wrap log-table-wrap">
+      <table class="roster log-table" id="activity-log-table">
+        <thead>
+          <tr>
+            <th style="width:160px;">🕒 時間 Timestamp</th>
+            <th style="width:160px;">👤 操作者 Operator</th>
+            <th style="width:120px;">🏷️ 動作類別</th>
+            <th>📝 異動詳細說明 Details</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${logs.length ? logs.map(l => {
+            let cat = 'other';
+            if (l.action === 'pick') cat = 'pick';
+            else if (l.action === 'drop') cat = 'drop';
+            else if (l.action === 'claim-leader' || l.action === 'unclaim-leader') cat = 'leader';
+            else if (l.action === 'toggle-vice' || l.action === 'vice') cat = 'vice';
+            else if (l.action === 'submit-peer-eval' || l.action === 'peer-eval') cat = 'eval';
+            else if (l.action && (l.action.startsWith('teacher') || l.action === 'clear-groups' || l.action === 'del-groups' || l.action === 'auto-assign')) cat = 'teacher';
+
+            return `
+            <tr data-cat="${esc(cat)}" data-search="${esc((l.time + ' ' + l.operator + ' ' + l.details).toLowerCase())}">
+              <td style="font-family:monospace;font-size:0.85rem;color:#475569;white-space:nowrap;">${esc(l.time)}</td>
+              <td><strong>${esc(l.operator)}</strong></td>
+              <td>${logActionBadge(l.action)}</td>
+              <td style="word-break:break-word;">${esc(l.details)}</td>
+            </tr>`;
+          }).join('') : `
+            <tr class="no-log-row">
+              <td colspan="4" style="text-align:center;padding:2rem;color:#94a3b8;">
+                目前尚無分組異動紀錄。當組長挑選、釋出組員或進行分組調整時，將即時在此留存日誌。
+              </td>
+            </tr>
+          `}
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function exportLogsCSV(c) {
+  const logs = Array.isArray(c.logs) ? c.logs : [];
+  if (!logs.length) return alert('目前尚無日誌資料可供匯出 No logs to export');
+  const rows = [['時間', '操作者', '動作代碼', '異動詳細說明']];
+  logs.forEach(l => {
+    rows.push([
+      l.time || '',
+      l.operator || '',
+      l.action || '',
+      l.details || '',
+    ]);
+  });
+  const csv = '﻿' + rows.map(r => r.map(x => `"${String(x).replace(/"/g, '""')}"`).join(',')).join('\n');
+  download(csv, `${c.year || 'grouping'}_${c.subject || 'data'}_分組異動日誌.csv`);
+}
+
+function filterLogRows() {
+  const searchInput = document.getElementById('log-search-input');
+  const filterSelect = document.getElementById('log-filter-action');
+  const table = document.getElementById('activity-log-table');
+  const countDisplay = document.getElementById('log-count-display');
+  if (!table) return;
+
+  const query = (searchInput ? searchInput.value : '').trim().toLowerCase();
+  const cat = filterSelect ? filterSelect.value : '';
+
+  const rows = table.querySelectorAll('tbody tr:not(.no-log-row)');
+  let visibleCount = 0;
+  rows.forEach(row => {
+    const rowCat = row.getAttribute('data-cat') || '';
+    const rowSearch = row.getAttribute('data-search') || '';
+    const matchCat = !cat || rowCat === cat;
+    const matchQuery = !query || rowSearch.includes(query);
+    if (matchCat && matchQuery) {
+      row.style.display = '';
+      visibleCount++;
+    } else {
+      row.style.display = 'none';
+    }
+  });
+
+  if (countDisplay) {
+    countDisplay.textContent = (query || cat) ? `顯示 ${visibleCount} / ${rows.length} 筆紀錄` : `共 ${rows.length} 筆紀錄`;
+  }
+}
+
 function teacherCourse(c) {
   const total = c.students.length;
   const assigned = c.students.filter(s => s.groupId).length;
@@ -721,6 +880,8 @@ function teacherCourse(c) {
       <button class="btn btn-danger" data-act="del-course" data-id="${c.id}" title="完全刪除本科目所有資料">刪除整個科目（含名單與分組）Delete course</button>
     </div>
   </div>
+
+  ${bulletinAdminBlock(c)}
 
   <div class="teacher-section">
     <h2>分組管理 Grouping</h2>
@@ -753,7 +914,7 @@ function teacherCourse(c) {
         <button class="btn btn-undo" data-act="restore-snapshot" title="復原至上次清空或建立組別前的分組狀態">↩️ 回到上一步 (復原分組) Undo</button>
       ` : ''}
       <button class="btn btn-secondary" data-act="export-json">匯出 JSON</button>
-      <button class="btn btn-secondary" data-act="export-csv">匯出 CSV</button>
+      <button class="btn btn-secondary" data-act="export-csv" title="匯出全體學生期末評分結果，依學號由小到大排序">匯出評分成績 CSV（依學號排序）</button>
     </div>
 
     <!-- 勾選要刪除的分組組別 -->
@@ -842,6 +1003,8 @@ function teacherCourse(c) {
         </div>
       </div>` : ''}
   </div>
+
+  ${activityLogsBlock(c)}
 
   <div class="roster-row">
     <div class="teacher-section">
@@ -1168,7 +1331,9 @@ function exportJSON(c) {
 
 function exportCSV(c) {
   const rows = [['學號', '姓名', '組別', '角色', '自動分組', '期末考調分', '調分原因說明', '組長加分評定']];
-  c.students.forEach(s => {
+  const sortedStudents = c.students.slice()
+    .sort((a, b) => String(a.id).localeCompare(String(b.id), 'zh-Hant', { numeric: true }));
+  sortedStudents.forEach(s => {
     const g = c.groups.find(x => x.id === s.groupId);
     const adj = calcAdjustment(c, g, s);
     rows.push([
@@ -1186,7 +1351,9 @@ function exportCSV(c) {
   download(csv, `${c.year || 'grouping'}_${c.subject || 'data'}_grading.csv`);
 }
 
-function download(content, type, filename) {
+function download(content, typeOrFilename, maybeFilename) {
+  const type = maybeFilename ? typeOrFilename : 'text/plain;charset=utf-8';
+  const filename = maybeFilename || typeOrFilename;
   const url = URL.createObjectURL(new Blob([content], { type }));
   const a = document.createElement('a');
   a.href = url; a.download = filename; a.click();
@@ -1248,14 +1415,22 @@ app.addEventListener('submit', e => {
       groupSize: Math.max(1, parseInt(f.groupSize.value) || 4),
       tolerance: Math.max(0, parseInt(f.tolerance.value) || 0),
       deadline: f.deadline ? f.deadline.value : (c ? (c.deadline || '') : ''),
-      notice: f.notice ? f.notice.value : '',
     }).then(data => {
-      if (data && data.courseId && data.courseId !== state.currentId) {
+      if (!data) return;
+      if (data.courseId && data.courseId !== state.currentId) {
         state.currentId = data.courseId;
         localStorage.setItem(CURRENT_KEY, data.courseId);
         render();
       }
+      alert('課程設定已儲存 ✅ Course settings saved');
     });
+  }
+  if (a === 'add-notice') {
+    const c = needCourse(); if (!c) return;
+    const content = f.content.value.trim();
+    if (!content) return alert('請輸入公告內容 Content required');
+    return act('teacher:add-notice', { courseId: c.id, content },
+      { after: () => { f.reset(); alert('公告已發布 ✅ Notice published'); } });
   }
   if (a === 'set-course-deadline') {
     const c = cur();
@@ -1268,7 +1443,6 @@ app.addEventListener('submit', e => {
       groupSize: c.groupSize,
       tolerance: c.tolerance,
       deadline: deadlineVal,
-      notice: c.notice !== undefined ? c.notice : '',
     }, {
       after: () => alert('分組截止時間已更新 Grouping deadline updated'),
     });
@@ -1347,6 +1521,11 @@ app.addEventListener('click', e => {
     const target = state.courses.find(x => x.id === id);
     if (!target || !confirm(`確定刪除「${courseLabel(target)}」及其名單與分組？`)) return;
     return act('teacher:del-course', { courseId: id });
+  }
+  if (a === 'del-notice') {
+    if (!c) return;
+    if (!confirm('確定刪除此則公告？')) return;
+    return act('teacher:del-notice', { courseId: c.id, noticeId: id });
   }
   if (a === 'del-student') {
     if (!c) return;
@@ -1445,6 +1624,13 @@ app.addEventListener('click', e => {
   }
   if (a === 'export-json') return c && exportJSON(c);
   if (a === 'export-csv') return c && exportCSV(c);
+  if (a === 'export-logs-csv') return c && exportLogsCSV(c);
+  if (a === 'clear-course-logs') {
+    if (!c) return;
+    if (!confirm(`確定清空「${courseLabel(c)}」的所有分組異動日誌紀錄？\n\n注意：此操作無法復原。`)) return;
+    return act('teacher:clear-logs', { courseId: c.id },
+      { after: () => alert('分組異動日誌已清空 ✅ Activity logs cleared') });
+  }
 
   if (a === 'claim-leader') return act('claim-leader');
   if (a === 'unclaim-leader') return act('unclaim-leader');
@@ -1452,8 +1638,17 @@ app.addEventListener('click', e => {
   if (a === 'drop') return act('drop', { studentId: id });
 });
 
+app.addEventListener('input', e => {
+  if (e.target && e.target.id === 'log-search-input') {
+    filterLogRows();
+  }
+});
+
 app.addEventListener('change', e => {
   const t = e.target;
+  if (t && t.id === 'log-filter-action') {
+    return filterLogRows();
+  }
   const a = t.dataset.act;
   if (!a) return;
   const id = t.dataset.id;

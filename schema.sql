@@ -50,3 +50,27 @@ CREATE TABLE IF NOT EXISTS group_snapshots (
   snapshot   TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+-- 公佈欄：每則公告獨立一筆，各自附帶發布時間
+CREATE TABLE IF NOT EXISTS notices (
+  id         TEXT PRIMARY KEY,
+  course_id  TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  content    TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  time_str   TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_notices_course ON notices(course_id, created_at DESC);
+
+-- 異動日誌：記錄組長挑選／釋出組員、身分變更及老師操作
+CREATE TABLE IF NOT EXISTS activity_logs (
+  id          TEXT PRIMARY KEY,
+  course_id   TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  operator    TEXT NOT NULL,        -- 操作者（如「組長 王小明 (410123)」或「老師」）
+  action      TEXT NOT NULL,        -- 動作類型（pick, drop, claim-leader, unclaim-leader 等）
+  details     TEXT NOT NULL,        -- 詳細說明
+  created_at  INTEGER NOT NULL,     -- Unix timestamp (ms)
+  time_str    TEXT NOT NULL DEFAULT '' -- 格式化時間 (YYYY-MM-DD HH:mm:ss)
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_logs_course ON activity_logs(course_id, created_at DESC);

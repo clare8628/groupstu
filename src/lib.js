@@ -105,7 +105,31 @@ async function ensureGroupSchema(db) {
   try {
     await db.prepare('CREATE TABLE IF NOT EXISTS group_snapshots (course_id TEXT PRIMARY KEY, snapshot TEXT NOT NULL, created_at INTEGER NOT NULL)').run();
   } catch (_) {}
+  try {
+    await db.prepare('CREATE TABLE IF NOT EXISTS notices (id TEXT PRIMARY KEY, course_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL, time_str TEXT NOT NULL DEFAULT \'\')').run();
+  } catch (_) {}
+  try {
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_notices_course ON notices(course_id, created_at DESC)').run();
+  } catch (_) {}
+  try {
+    await db.prepare('CREATE TABLE IF NOT EXISTS activity_logs (id TEXT PRIMARY KEY, course_id TEXT NOT NULL, operator TEXT NOT NULL, action TEXT NOT NULL, details TEXT NOT NULL, created_at INTEGER NOT NULL, time_str TEXT NOT NULL DEFAULT \'\')').run();
+  } catch (_) {}
+  try {
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_activity_logs_course ON activity_logs(course_id, created_at DESC)').run();
+  } catch (_) {}
   _ensuredGroupSchema = true;
+}
+
+export async function addLog(db, courseId, operator, action, details) {
+  try {
+    const id = 'log_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    const now = Date.now();
+    const timeStr = new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+    await db.prepare('INSERT INTO activity_logs (id, course_id, operator, action, details, created_at, time_str) VALUES (?,?,?,?,?,?,?)')
+      .bind(id, courseId, operator, action, details, now, timeStr).run();
+  } catch (e) {
+    console.error('Failed to record activity log:', e);
+  }
 }
 
 export const DEFAULT_NOTICE = `【期末考成績加減分與評分規定】：
@@ -190,11 +214,13 @@ export function calcAdjustment(c, g, s) {
 
 export async function loadState(db) {
   await ensureGroupSchema(db);
-  const [courses, groups, students, snapshots] = await Promise.all([
+  const [courses, groups, students, snapshots, notices, logs] = await Promise.all([
     db.prepare('SELECT * FROM courses ORDER BY year DESC, created_at ASC').all(),
     db.prepare('SELECT * FROM groups ORDER BY seq ASC').all(),
     db.prepare('SELECT * FROM students ORDER BY seq ASC').all(),
     db.prepare('SELECT course_id FROM group_snapshots').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM notices ORDER BY created_at DESC').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 1000').all().catch(() => ({ results: [] })),
   ]);
   const snapshotSet = new Set((snapshots.results || []).map(r => r.course_id));
   return courses.results.map(c => {
@@ -214,12 +240,27 @@ export async function loadState(db) {
       peerComment: s.peer_comment || '',
     }));
 
+    const courseNotices = notices.results
+      .filter(n => n.course_id === c.id)
+      .map(n => ({ id: n.id, content: n.content, time: n.time_str || '' }));
+
+    const courseLogs = (logs.results || [])
+      .filter(l => l.course_id === c.id)
+      .map(l => ({
+        id: l.id,
+        operator: l.operator || '',
+        action: l.action || '',
+        details: l.details || '',
+        time: l.time_str || (l.created_at ? new Date(l.created_at + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ') : ''),
+        createdAt: l.created_at || 0,
+      }));
+
     // 計算每位同學的調分結果
     const courseObj = {
       id: c.id, year: c.year, subject: c.subject,
       groupSize: c.group_size, tolerance: c.tolerance, deadline: c.deadline,
-      notice: c.notice !== undefined && c.notice !== null ? c.notice : DEFAULT_NOTICE,
-      noticeTime: c.notice_time || (c.created_at ? new Date(c.created_at + 8 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' ') : ''),
+      notices: courseNotices,
+      logs: courseLogs,
       hasSnapshot: snapshotSet.has(c.id),
       groups: courseGroups,
       students: courseStudents,
@@ -317,16 +358,27 @@ export async function publicize(db, env, courses, session) {
   const hmacKey = await getHmacKey(db, env);
   const out = [];
   for (const c of courses) {
+    // 期末組長評分僅老師看得到：一般同學／未登入者一律隱藏調分與加分細節，
+    // 僅組長本人可在自己組內看到（評分作業所需），供其填寫／檢視評分表單。
+    let leaderGroupId = null;
+    if (selfId && c.id === selfCourse) {
+      const selfRec = c.students.find(s => s.id === selfId);
+      if (selfRec && selfRec.isLeader && selfRec.groupId) leaderGroupId = selfRec.groupId;
+    }
     const students = [];
     for (const s of c.students) {
       const mine = selfId && s.id === selfId && c.id === selfCourse;
+      const isMyGroupMember = leaderGroupId && s.groupId === leaderGroupId;
+      const { adjustment, peerPenalty, peerComment, ...rest } = s;
       students.push({
-        ...s,
+        ...rest,
+        ...(isMyGroupMember ? { peerPenalty, peerComment } : {}),
         id: mine ? s.id : maskId(s.id),
         ref: await studentRef(db, env, c.id, s.id, hmacKey),
       });
     }
-    out.push({ ...c, students });
+    const { logs, ...courseWithoutLogs } = c;
+    out.push({ ...courseWithoutLogs, students });
   }
   return out;
 }

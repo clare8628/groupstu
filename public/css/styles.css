@@ -158,8 +158,61 @@ table.roster tr:hover td { background: #fcfcfc; }
 .tree li button { display: block; width: 100%; text-align: left; padding: .45rem .6rem; border-radius: 4px; font-size: .9rem; color: #333; }
 .tree li button:hover { background: #f4f8fb; }
 .tree li.active { border-left-color: #e67e22; }
-.tree li.active button { background: #fdf1e6; color: #d35400; font-weight: bold; }
+.tree li.active > button { background: #fdf1e6; color: #d35400; font-weight: bold; }
 .tree .count { display: block; font-size: .7rem; color: #999; font-weight: normal; }
+
+/* 課程子項目快速連結 (課程分組 / 異動日誌) */
+.tree-sub-links {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 0.35rem 0.25rem 0.35rem 0.6rem;
+  background: #fff8f0;
+  border-radius: 0 0 6px 6px;
+  margin-top: 2px;
+  border-top: 1px dashed #fbd38d;
+}
+
+.tree-sub-btn {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0.32rem 0.55rem !important;
+  font-size: 0.82rem !important;
+  font-weight: 500 !important;
+  color: #78350f !important;
+  background: transparent !important;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tree-sub-btn:hover {
+  background: #ffedd5 !important;
+  color: #9a3412 !important;
+}
+
+.tree-sub-btn.on {
+  background: #ea580c !important;
+  color: #ffffff !important;
+  font-weight: 700 !important;
+}
+
+.tree-sub-btn .sub-count {
+  background: rgba(0, 0, 0, 0.08);
+  font-size: 0.72rem;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.tree-sub-btn.on .sub-count {
+  background: rgba(255, 255, 255, 0.3);
+  color: #fff;
+}
+
 .tree .btn { width: 100%; margin-top: 1rem; font-size: .85rem; padding: .5rem; }
 .course-picker { margin-bottom: 1.25rem; }
 .course-picker select { width: 100%; }
@@ -172,7 +225,7 @@ h2 small { font-size: .8rem; font-weight: normal; color: #888; margin-left: .5re
 
 /* ===== 頁首品牌區 Header brand ===== */
 nav .brand { display: flex; align-items: baseline; gap: .5rem; }
-nav .ver { font-size: .7rem; font-weight: bold; letter-spacing: .5px; background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.3); color: #ecf0f1; padding: 1px 7px; border-radius: 10px; }
+nav .ver { font-size: .72rem; font-weight: 600; letter-spacing: .4px; background: rgba(255,255,255,.2); border: 1px solid rgba(255,255,255,.35); color: #fff; padding: 2px 8px; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); white-space: nowrap; }
 nav .course-tag { font-size: .85rem; opacity: .8; padding-left: 1rem; border-left: 1px solid rgba(255,255,255,.25); }
 nav .teacher-link { color: #fff; opacity: .85; font-size: .9rem; padding: .4rem .8rem; border: 1px solid rgba(255,255,255,.4); border-radius: 4px; }
 nav .teacher-link:hover { opacity: 1; border-color: #e67e22; color: #e67e22; }

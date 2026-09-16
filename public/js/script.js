@@ -1,6 +1,6 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.0.0';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.2.0 (2026.09.16-1340)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
@@ -12,7 +12,7 @@ let state = {
   currentId: localStorage.getItem(CURRENT_KEY) || null,
 };
 let loginMode = null;   // 前台登入區：null | 'student' | 'teacher'
-let teacherView = 'course';   // 後台主區：'course' | 'settings' | 'eval'
+let teacherView = 'course';   // 後台主區：'course' | 'settings' | 'eval' | 'logs'
 let teacherPreviewMode = localStorage.getItem(PREVIEW_KEY) || 'admin';  // 老師預覽模式：'admin' | 'public' | 'leader'
 let busy = false;
 let lastSig = '';
@@ -40,6 +40,7 @@ async function apiPost(action, payload = {}) {
 function apply(data) {
   if (data.courses) state.courses = data.courses;
   if (data.session !== undefined) state.session = data.session;
+  if (data.version) state.version = data.version;
   if (state.session && state.session.role === 'student') state.currentId = state.session.courseId;
   if (!state.courses.some(c => c.id === state.currentId)) {
     state.currentId = state.courses.length ? state.courses[0].id : null;
@@ -562,28 +563,51 @@ function courseTree() {
     (byYear[y] = byYear[y] || []).push(c);
   });
   const years = Object.keys(byYear).sort().reverse();
+  const activeCourse = cur();
+
   return `<aside class="tree">
     <h3>課程 Courses</h3>
     ${years.length ? years.map(y => `
       <div class="tree-year">
         <div class="tree-year-label">${esc(y)}</div>
-        <ul>${byYear[y].map(c => `
-          <li class="${state.currentId === c.id && teacherView === 'course' ? 'active' : ''}">
-            <button data-act="pick-course-node" data-id="${c.id}">
+        <ul>${byYear[y].map(c => {
+          const isSelected = state.currentId === c.id;
+          const countLogs = Array.isArray(c.logs) ? c.logs.length : 0;
+          return `
+          <li class="${isSelected && (teacherView === 'course' || teacherView === 'logs') ? 'active' : ''}">
+            <button data-act="pick-course-node" data-id="${c.id}" class="tree-course-main-btn">
               ${esc(c.subject || '（未命名科目）')}
               <span class="count">${c.students.length} 人 / ${c.groups.length} 組</span>
             </button>
-          </li>`).join('')}</ul>
+            ${isSelected ? `
+              <div class="tree-sub-links">
+                <button class="tree-sub-btn ${teacherView === 'course' ? 'on' : ''}" data-act="goto-course-setup" data-id="${c.id}" title="進入課程與分組管理">
+                  <span>⚙️ 課程與分組</span>
+                </button>
+                <button class="tree-sub-btn ${teacherView === 'logs' ? 'on' : ''}" data-act="goto-course-logs" data-id="${c.id}" title="檢視本科目異動日誌">
+                  <span>📋 異動日誌</span>
+                  ${countLogs ? `<span class="sub-count">${countLogs}</span>` : ''}
+                </button>
+              </div>
+            ` : ''}
+          </li>`;
+        }).join('')}</ul>
       </div>`).join('') : '<p class="file-path">尚無課程，請於右側「課程設定」建立。</p>'}
     <button class="btn btn-secondary" data-act="new-course">＋ 新增課程 New course</button>
     <div class="tree-year tree-sys">
-      <div class="tree-year-label">系統設定 System</div>
+      <div class="tree-year-label">日誌與系統設定 System & Logs</div>
       <ul>
-        <li class="${teacherView === 'settings' ? 'active' : ''}">
-          <button data-act="sys-password">更改管理者密碼<span class="count">Change admin password</span></button>
+        <li class="${teacherView === 'logs' ? 'active' : ''}">
+          <button data-act="sys-logs">
+            📋 分組異動日誌
+            <span class="count">${activeCourse ? `${esc(activeCourse.subject)} (${(activeCourse.logs || []).length} 筆)` : 'Activity logs'}</span>
+          </button>
         </li>
         <li class="${teacherView === 'eval' ? 'active' : ''}">
           <button data-act="sys-peer-eval">學期成績加減分與組長評分控制<span class="count">Peer evaluation</span></button>
+        </li>
+        <li class="${teacherView === 'settings' ? 'active' : ''}">
+          <button data-act="sys-password">更改管理者密碼<span class="count">Change admin password</span></button>
         </li>
       </ul>
     </div>
@@ -597,10 +621,35 @@ function teacherScreen() {
     main = teacherPasswordBlock();
   } else if (teacherView === 'eval') {
     main = teacherPeerEvalBlock(c);
+  } else if (teacherView === 'logs') {
+    main = teacherLogsScreen(c);
   } else {
     main = c ? teacherCourse(c) : teacherNoCourse();
   }
   return `<div class="layout">${courseTree()}<main>${main}</main></div>`;
+}
+
+function teacherLogsScreen(c) {
+  if (!c) {
+    return `
+    <div class="teacher-section">
+      <h2>📋 分組異動日誌 <small>Activity Log</small></h2>
+      <p class="file-path">請先從左側選擇或建立課程，即可檢視該課程的分組異動日誌。</p>
+    </div>`;
+  }
+  return `
+  <div class="teacher-section" style="padding:1.2rem 1.5rem;margin-bottom:1rem;background:#fff;border-radius:8px;border:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;">
+    <div>
+      <h2 style="margin:0 0 0.35rem 0;">📋 分組異動日誌 <small>${esc(courseLabel(c))}</small></h2>
+      <p class="file-path" style="margin:0;">目前檢視：<b>${esc(c.year)} ${esc(c.subject)}</b> 的分組異動紀錄</p>
+    </div>
+    <div style="display:flex;gap:0.5rem;align-items:center;">
+      <button class="btn btn-secondary" data-act="goto-course-setup" data-id="${c.id}" style="margin:0;padding:0.45rem 1rem;font-size:0.88rem;">
+        ⚙️ 前往課程與分組管理
+      </button>
+    </div>
+  </div>
+  ${activityLogsBlock(c)}`;
 }
 
 function teacherNoCourse() {
@@ -913,6 +962,7 @@ function teacherCourse(c) {
       ${c.hasSnapshot ? `
         <button class="btn btn-undo" data-act="restore-snapshot" title="復原至上次清空或建立組別前的分組狀態">↩️ 回到上一步 (復原分組) Undo</button>
       ` : ''}
+      <button class="btn btn-secondary" data-act="goto-course-logs" data-id="${c.id}" title="前往本科目分組異動日誌">📋 分組異動日誌 (${(c.logs || []).length})</button>
       <button class="btn btn-secondary" data-act="export-json">匯出 JSON</button>
       <button class="btn btn-secondary" data-act="export-csv" title="匯出全體學生期末評分結果，依學號由小到大排序">匯出評分成績 CSV（依學號排序）</button>
     </div>
@@ -1507,9 +1557,22 @@ app.addEventListener('click', e => {
   if (a === 'close-login') { loginMode = null; return render(); }
   if (a === 'sys-password') { teacherView = 'settings'; return render(); }
   if (a === 'sys-peer-eval') { teacherView = 'eval'; return render(); }
+  if (a === 'sys-logs') { teacherView = 'logs'; return render(); }
+  if (a === 'goto-course-setup') {
+    if (id) state.currentId = id;
+    teacherView = 'course';
+    localStorage.setItem(CURRENT_KEY, state.currentId);
+    return render();
+  }
+  if (a === 'goto-course-logs') {
+    if (id) state.currentId = id;
+    teacherView = 'logs';
+    localStorage.setItem(CURRENT_KEY, state.currentId);
+    return render();
+  }
   if (a === 'pick-course-node' || a === 'pick-course') {
     state.currentId = id || btn.value;
-    if (teacherView !== 'eval') {
+    if (teacherView !== 'eval' && teacherView !== 'logs') {
       teacherView = 'course';
     }
     localStorage.setItem(CURRENT_KEY, state.currentId);

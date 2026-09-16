@@ -1,3 +1,4 @@
+export const API_VERSION = 'v2.2.0 (2026.09.16-1340)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
@@ -8,7 +9,7 @@ import {
 export async function handleState(request, env, db) {
   const session = await readSession(db, env, request);
   const courses = await applyDeadline(db, await loadState(db));
-  return json({ courses: await publicize(db, env, courses, session), session });
+  return json({ courses: await publicize(db, env, courses, session), session, version: API_VERSION });
 }
 
 /* POST /api/action — 所有異動，依角色驗證 */
@@ -20,7 +21,7 @@ export async function handleAction(request, env, db, body) {
   const course = id => courses.find(c => c.id === id);
   const ok = async (extra = {}, headers = {}) => {
     const view = extra.session !== undefined ? extra.session : session;
-    return json({ ok: true, courses: await publicize(db, env, await loadState(db), view), ...extra }, 200, headers);
+    return json({ ok: true, courses: await publicize(db, env, await loadState(db), view), version: API_VERSION, ...extra }, 200, headers);
   };
 
   const saveSnapshot = async (db, courseId) => {

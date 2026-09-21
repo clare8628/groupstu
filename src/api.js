@@ -1,15 +1,40 @@
-export const API_VERSION = 'v2.2.0 (2026.09.16-1340)';
+export const API_VERSION = 'v2.2.0 (2026.09.21-1710)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
   applyDeadline, publicize, resolveStudent, canGroupLeaderEdit, DEFAULT_NOTICE, addLog,
+  fetchCourseLogs,
 } from './lib.js';
+
+// 短暫記憶體快取防護（針對公開未登入/學生輪詢，有效緩解 D1 讀取消耗）
+let _stateCache = null;
+let _stateCacheExpiry = 0;
+const CACHE_TTL_MS = 5000; // 5 秒防護期
+
+export function invalidateStateCache() {
+  _stateCache = null;
+  _stateCacheExpiry = 0;
+}
 
 /* GET /api/state — 公開讀取全部課程／名單／分組 */
 export async function handleState(request, env, db) {
   const session = await readSession(db, env, request);
+  const now = Date.now();
+
+  // 若為未登入訪客且快取有效，直接回傳快取資料
+  if (!session && _stateCache && now < _stateCacheExpiry) {
+    return json({ courses: _stateCache, session: null, version: API_VERSION });
+  }
+
   const courses = await applyDeadline(db, await loadState(db));
-  return json({ courses: await publicize(db, env, courses, session), session, version: API_VERSION });
+  const publicCourses = await publicize(db, env, courses, session);
+
+  if (!session) {
+    _stateCache = publicCourses;
+    _stateCacheExpiry = now + CACHE_TTL_MS;
+  }
+
+  return json({ courses: publicCourses, session, version: API_VERSION });
 }
 
 /* POST /api/action — 所有異動，依角色驗證 */
@@ -17,9 +42,23 @@ export async function handleAction(request, env, db, body) {
   const action = body && body.action;
   if (!action) return bad('缺少 action');
   const session = await readSession(db, env, request);
+
+  // 異動動作發生時清空狀態快取
+  invalidateStateCache();
+
+  // 針對按需取得日誌，不需全量重新 loadState
+  if (action === 'teacher:get-logs') {
+    if (!session || session.role !== 'teacher') return bad('需要老師權限 Teacher only', 403);
+    const courseId = body.courseId;
+    if (!courseId) return bad('缺少 courseId', 400);
+    const logs = await fetchCourseLogs(db, courseId, 500);
+    return json({ ok: true, logs });
+  }
+
   const courses = await loadState(db);
   const course = id => courses.find(c => c.id === id);
   const ok = async (extra = {}, headers = {}) => {
+    invalidateStateCache();
     const view = extra.session !== undefined ? extra.session : session;
     return json({ ok: true, courses: await publicize(db, env, await loadState(db), view), version: API_VERSION, ...extra }, 200, headers);
   };

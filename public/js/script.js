@@ -1,10 +1,10 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.2.0 (2026.09.16-1340)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.2.0 (2026.09.21-1710)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
-const POLL_MS = 5000;
+const POLL_MS = 15000;   // 輪詢延長為 15 秒，降低 D1 消耗
 
 let state = {
   courses: [],
@@ -16,6 +16,27 @@ let teacherView = 'course';   // 後台主區：'course' | 'settings' | 'eval' |
 let teacherPreviewMode = localStorage.getItem(PREVIEW_KEY) || 'admin';  // 老師預覽模式：'admin' | 'public' | 'leader'
 let busy = false;
 let lastSig = '';
+let courseLogsCache = {};   // 依課程快取異動日誌：{ [courseId]: logsArray }
+let logsLoading = false;    // 日誌讀取中狀態
+
+/* 按需載入課程異動日誌 */
+async function loadLogsForCourse(courseId, force = false) {
+  if (!courseId) return;
+  if (!force && courseLogsCache[courseId]) return;
+  logsLoading = true;
+  render();
+  try {
+    const res = await apiPost('teacher:get-logs', { courseId });
+    if (res && res.ok && Array.isArray(res.logs)) {
+      courseLogsCache[courseId] = res.logs;
+    }
+  } catch (err) {
+    console.error('載入日誌失敗:', err);
+  } finally {
+    logsLoading = false;
+    render();
+  }
+}
 
 /* ===== API ===== */
 async function apiGet() {
@@ -572,7 +593,7 @@ function courseTree() {
         <div class="tree-year-label">${esc(y)}</div>
         <ul>${byYear[y].map(c => {
           const isSelected = state.currentId === c.id;
-          const countLogs = Array.isArray(c.logs) ? c.logs.length : 0;
+          const cached = courseLogsCache && courseLogsCache[c.id];
           return `
           <li class="${isSelected && (teacherView === 'course' || teacherView === 'logs') ? 'active' : ''}">
             <button data-act="pick-course-node" data-id="${c.id}" class="tree-course-main-btn">
@@ -586,7 +607,7 @@ function courseTree() {
                 </button>
                 <button class="tree-sub-btn ${teacherView === 'logs' ? 'on' : ''}" data-act="goto-course-logs" data-id="${c.id}" title="檢視本科目異動日誌">
                   <span>📋 異動日誌</span>
-                  ${countLogs ? `<span class="sub-count">${countLogs}</span>` : ''}
+                  ${cached ? `<span class="sub-count">${cached.length}</span>` : ''}
                 </button>
               </div>
             ` : ''}
@@ -600,7 +621,7 @@ function courseTree() {
         <li class="${teacherView === 'logs' ? 'active' : ''}">
           <button data-act="sys-logs">
             📋 分組異動日誌
-            <span class="count">${activeCourse ? `${esc(activeCourse.subject)} (${(activeCourse.logs || []).length} 筆)` : 'Activity logs'}</span>
+            <span class="count">${activeCourse ? `${esc(activeCourse.subject)}` : 'Activity logs'}</span>
           </button>
         </li>
         <li class="${teacherView === 'eval' ? 'active' : ''}">
@@ -784,15 +805,20 @@ function logActionBadge(action) {
 }
 
 function activityLogsBlock(c) {
-  const logs = Array.isArray(c.logs) ? c.logs : [];
+  const logs = (courseLogsCache && courseLogsCache[c.id]) || [];
+  const isLoaded = courseLogsCache && Object.prototype.hasOwnProperty.call(courseLogsCache, c.id);
+
   return `
   <div class="teacher-section activity-logs-section">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:0.75rem;">
       <div style="display:flex;align-items:baseline;gap:0.5rem;flex-wrap:wrap;">
         <h2 style="margin:0;">📋 分組異動日誌 <small>Activity Log</small></h2>
-        <span class="log-count-pill" id="log-count-display">共 ${logs.length} 筆紀錄</span>
+        <span class="log-count-pill" id="log-count-display">${logsLoading ? '⏳ 載入中...' : `共 ${logs.length} 筆紀錄`}</span>
       </div>
       <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+        <button class="btn btn-secondary" style="padding:0.4rem 0.9rem;font-size:0.85rem;margin:0;" data-act="refresh-course-logs" data-id="${c.id}" title="重新向資料庫載入最新日誌">
+          🔄 重新整理日誌
+        </button>
         <button class="btn btn-secondary" style="padding:0.4rem 0.9rem;font-size:0.85rem;margin:0;" data-act="export-logs-csv" title="匯出異動日誌為 CSV 檔">
           📥 匯出日誌 CSV
         </button>
@@ -804,7 +830,7 @@ function activityLogsBlock(c) {
       </div>
     </div>
     <p class="file-path" style="margin:0 0 0.85rem 0;">
-      系統即時記錄組長挑選／釋出組員、登記／取消組長身分與老師分組調整之詳細操作。可透過關鍵字搜尋或動作類別進行篩選。
+      系統即時記錄組長挑選／釋出組員、登記／取消組長身分與老師分組調整之詳細操作。為節省系統資源，日誌採「按需讀取」，可點擊「重新整理日誌」取得最新紀錄。
     </p>
 
     <!-- 篩選與搜尋工具列 -->
@@ -839,7 +865,13 @@ function activityLogsBlock(c) {
           </tr>
         </thead>
         <tbody>
-          ${logs.length ? logs.map(l => {
+          ${logsLoading ? `
+            <tr class="no-log-row">
+              <td colspan="4" style="text-align:center;padding:2rem;color:#64748b;">
+                ⏳ 正在向雲端資料庫按需載入日誌紀錄，請稍候...
+              </td>
+            </tr>
+          ` : logs.length ? logs.map(l => {
             let cat = 'other';
             if (l.action === 'pick') cat = 'pick';
             else if (l.action === 'drop') cat = 'drop';
@@ -858,7 +890,7 @@ function activityLogsBlock(c) {
           }).join('') : `
             <tr class="no-log-row">
               <td colspan="4" style="text-align:center;padding:2rem;color:#94a3b8;">
-                目前尚無分組異動紀錄。當組長挑選、釋出組員或進行分組調整時，將即時在此留存日誌。
+                ${isLoaded ? '目前尚無分組異動紀錄。當組長挑選、釋出組員或進行分組調整時，將即時留存日誌。' : '尚未載入日誌紀錄，請點擊上方「🔄 重新整理日誌」載入。'}
               </td>
             </tr>
           `}
@@ -869,8 +901,8 @@ function activityLogsBlock(c) {
 }
 
 function exportLogsCSV(c) {
-  const logs = Array.isArray(c.logs) ? c.logs : [];
-  if (!logs.length) return alert('目前尚無日誌資料可供匯出 No logs to export');
+  const logs = (courseLogsCache && courseLogsCache[c.id]) || [];
+  if (!logs.length) return alert('目前尚無日誌資料可供匯出，請先點擊「🔄 重新整理日誌」載入資料。');
   const rows = [['時間', '操作者', '動作代碼', '異動詳細說明']];
   logs.forEach(l => {
     rows.push([
@@ -962,7 +994,7 @@ function teacherCourse(c) {
       ${c.hasSnapshot ? `
         <button class="btn btn-undo" data-act="restore-snapshot" title="復原至上次清空或建立組別前的分組狀態">↩️ 回到上一步 (復原分組) Undo</button>
       ` : ''}
-      <button class="btn btn-secondary" data-act="goto-course-logs" data-id="${c.id}" title="前往本科目分組異動日誌">📋 分組異動日誌 (${(c.logs || []).length})</button>
+      <button class="btn btn-secondary" data-act="goto-course-logs" data-id="${c.id}" title="前往本科目分組異動日誌">📋 分組異動日誌${courseLogsCache && courseLogsCache[c.id] ? ` (${courseLogsCache[c.id].length})` : ''}</button>
       <button class="btn btn-secondary" data-act="export-json">匯出 JSON</button>
       <button class="btn btn-secondary" data-act="export-csv" title="匯出全體學生期末評分結果，依學號由小到大排序">匯出評分成績 CSV（依學號排序）</button>
     </div>
@@ -1557,7 +1589,11 @@ app.addEventListener('click', e => {
   if (a === 'close-login') { loginMode = null; return render(); }
   if (a === 'sys-password') { teacherView = 'settings'; return render(); }
   if (a === 'sys-peer-eval') { teacherView = 'eval'; return render(); }
-  if (a === 'sys-logs') { teacherView = 'logs'; return render(); }
+  if (a === 'sys-logs') {
+    teacherView = 'logs';
+    if (c) loadLogsForCourse(c.id);
+    return render();
+  }
   if (a === 'goto-course-setup') {
     if (id) state.currentId = id;
     teacherView = 'course';
@@ -1568,12 +1604,15 @@ app.addEventListener('click', e => {
     if (id) state.currentId = id;
     teacherView = 'logs';
     localStorage.setItem(CURRENT_KEY, state.currentId);
+    loadLogsForCourse(state.currentId);
     return render();
   }
   if (a === 'pick-course-node' || a === 'pick-course') {
     state.currentId = id || btn.value;
     if (teacherView !== 'eval' && teacherView !== 'logs') {
       teacherView = 'course';
+    } else if (teacherView === 'logs') {
+      loadLogsForCourse(state.currentId);
     }
     localStorage.setItem(CURRENT_KEY, state.currentId);
     return render();
@@ -1685,6 +1724,10 @@ app.addEventListener('click', e => {
     }
     return act('teacher:set-peer-eval', { courseId: c.id, groupId: id, open, deadline });
   }
+  if (a === 'refresh-course-logs') {
+    if (!c) return;
+    return loadLogsForCourse(c.id, true);
+  }
   if (a === 'export-json') return c && exportJSON(c);
   if (a === 'export-csv') return c && exportCSV(c);
   if (a === 'export-logs-csv') return c && exportLogsCSV(c);
@@ -1692,7 +1735,11 @@ app.addEventListener('click', e => {
     if (!c) return;
     if (!confirm(`確定清空「${courseLabel(c)}」的所有分組異動日誌紀錄？\n\n注意：此操作無法復原。`)) return;
     return act('teacher:clear-logs', { courseId: c.id },
-      { after: () => alert('分組異動日誌已清空 ✅ Activity logs cleared') });
+      { after: () => {
+        delete courseLogsCache[c.id];
+        loadLogsForCourse(c.id, true);
+        alert('分組異動日誌已清空 ✅ Activity logs cleared');
+      }});
   }
 
   if (a === 'claim-leader') return act('claim-leader');

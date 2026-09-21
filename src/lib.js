@@ -132,6 +132,24 @@ export async function addLog(db, courseId, operator, action, details) {
   }
 }
 
+export async function fetchCourseLogs(db, courseId, limit = 500) {
+  try {
+    const rows = await db.prepare('SELECT * FROM activity_logs WHERE course_id = ? ORDER BY created_at DESC LIMIT ?')
+      .bind(courseId, limit).all();
+    return (rows.results || []).map(l => ({
+      id: l.id,
+      operator: l.operator || '',
+      action: l.action || '',
+      details: l.details || '',
+      time: l.time_str || (l.created_at ? new Date(l.created_at + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ') : ''),
+      createdAt: l.created_at || 0,
+    }));
+  } catch (e) {
+    console.error('Failed to fetch course logs:', e);
+    return [];
+  }
+}
+
 export const DEFAULT_NOTICE = `【期末考成績加減分與評分規定】：
 1. 當老師開放組長評分權限時，組長可依據組員之貢獻或配合程度於期末時給予加分 (0 ~ 10 分)。
 2. 組長在老師開放評分權限時進行評分，組長自己可獲得 10 分的加分。
@@ -214,13 +232,12 @@ export function calcAdjustment(c, g, s) {
 
 export async function loadState(db) {
   await ensureGroupSchema(db);
-  const [courses, groups, students, snapshots, notices, logs] = await Promise.all([
+  const [courses, groups, students, snapshots, notices] = await Promise.all([
     db.prepare('SELECT * FROM courses ORDER BY year DESC, created_at ASC').all(),
     db.prepare('SELECT * FROM groups ORDER BY seq ASC').all(),
     db.prepare('SELECT * FROM students ORDER BY seq ASC').all(),
     db.prepare('SELECT course_id FROM group_snapshots').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM notices ORDER BY created_at DESC').all().catch(() => ({ results: [] })),
-    db.prepare('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 1000').all().catch(() => ({ results: [] })),
   ]);
   const snapshotSet = new Set((snapshots.results || []).map(r => r.course_id));
   return courses.results.map(c => {
@@ -244,23 +261,12 @@ export async function loadState(db) {
       .filter(n => n.course_id === c.id)
       .map(n => ({ id: n.id, content: n.content, time: n.time_str || '' }));
 
-    const courseLogs = (logs.results || [])
-      .filter(l => l.course_id === c.id)
-      .map(l => ({
-        id: l.id,
-        operator: l.operator || '',
-        action: l.action || '',
-        details: l.details || '',
-        time: l.time_str || (l.created_at ? new Date(l.created_at + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ') : ''),
-        createdAt: l.created_at || 0,
-      }));
-
     // 計算每位同學的調分結果
     const courseObj = {
       id: c.id, year: c.year, subject: c.subject,
       groupSize: c.group_size, tolerance: c.tolerance, deadline: c.deadline,
       notices: courseNotices,
-      logs: courseLogs,
+      logs: [], // 依需動態載入，避免每次常態輪詢浪費 D1 額度
       hasSnapshot: snapshotSet.has(c.id),
       groups: courseGroups,
       students: courseStudents,

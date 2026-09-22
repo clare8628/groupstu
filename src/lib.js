@@ -117,7 +117,100 @@ async function ensureGroupSchema(db) {
   try {
     await db.prepare('CREATE INDEX IF NOT EXISTS idx_activity_logs_course ON activity_logs(course_id, created_at DESC)').run();
   } catch (_) {}
+  try {
+    await db.prepare('ALTER TABLE students ADD COLUMN password_hash TEXT NOT NULL DEFAULT \'\'').run();
+  } catch (_) {}
+  try {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS attendance_sessions (
+      id          TEXT NOT NULL,
+      course_id   TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      date        TEXT NOT NULL DEFAULT '',
+      time_slot   TEXT NOT NULL DEFAULT '',
+      name        TEXT NOT NULL DEFAULT '',
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (course_id, id)
+    )`).run();
+  } catch (_) {}
+  try {
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_attendance_sessions_course ON attendance_sessions(course_id, date DESC)').run();
+  } catch (_) {}
+  try {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS attendance_records (
+      course_id      TEXT NOT NULL,
+      session_id     TEXT NOT NULL,
+      student_id     TEXT NOT NULL,
+      group_id       TEXT NOT NULL DEFAULT '',
+      status         TEXT NOT NULL DEFAULT 'present',
+      marked_by_id   TEXT NOT NULL DEFAULT '',
+      marked_by_name TEXT NOT NULL DEFAULT '',
+      created_at     INTEGER NOT NULL DEFAULT 0,
+      updated_at     INTEGER NOT NULL,
+      PRIMARY KEY (course_id, session_id, student_id)
+    )`).run();
+  } catch (_) {}
+  try {
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_attendance_records_session ON attendance_records(course_id, session_id)').run();
+  } catch (_) {}
+  try {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS attendance_unlocks (
+      course_id  TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      group_id   TEXT NOT NULL DEFAULT '',
+      deadline   TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (course_id, session_id, group_id)
+    )`).run();
+  } catch (_) {}
+  try {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS attendance_delegates (
+      course_id     TEXT NOT NULL,
+      session_id    TEXT NOT NULL,
+      group_id      TEXT NOT NULL,
+      delegate_id   TEXT NOT NULL,
+      delegate_name TEXT NOT NULL DEFAULT '',
+      created_at    INTEGER NOT NULL,
+      PRIMARY KEY (course_id, session_id, group_id, delegate_id)
+    )`).run();
+  } catch (_) {}
   _ensuredGroupSchema = true;
+}
+
+/* ===== 伺服器短暫記憶體快取與快取失效 ===== */
+let _cachedRawCourses = null;
+let _cachedRawTime = 0;
+const RAW_CACHE_TTL = 4000; // 4 秒記憶體快取，收斂課堂尖峰瞬間連線
+
+export function invalidateStateCache() {
+  _cachedRawCourses = null;
+  _cachedRawTime = 0;
+}
+
+/* ===== 點名核心輔助演算法 ===== */
+export const todayDateStr = () => {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+};
+
+export function isDailySession(session) {
+  if (!session) return false;
+  if (session.isDaily) return true;
+  if (session.id && String(session.id).startsWith('daily-')) return true;
+  if (session.name === '一般日常點名' || session.name === '日常點名') return true;
+  return false;
+}
+
+export function attendanceUnlockFor(unlocks = [], sessionId, groupId) {
+  const now = Date.now();
+  return (unlocks || []).find(u =>
+    u.sessionId === sessionId
+    && (u.groupId === groupId || u.groupId === '')
+    && (!u.deadline || new Date(u.deadline).getTime() > now)
+  ) || null;
+}
+
+export function isAttendanceEditable(session, unlocks = [], groupId = '') {
+  if (!session) return false;
+  if (session.date === todayDateStr()) return true;
+  return !!attendanceUnlockFor(unlocks, session.id, groupId);
 }
 
 export async function addLog(db, courseId, operator, action, details) {
@@ -231,16 +324,25 @@ export function calcAdjustment(c, g, s) {
 }
 
 export async function loadState(db) {
+  const now = Date.now();
+  if (_cachedRawCourses && (now - _cachedRawTime < RAW_CACHE_TTL)) {
+    return structuredClone(_cachedRawCourses);
+  }
+
   await ensureGroupSchema(db);
-  const [courses, groups, students, snapshots, notices] = await Promise.all([
+  const [courses, groups, students, snapshots, notices, attSessions, attRecords, attUnlocks, attDelegates] = await Promise.all([
     db.prepare('SELECT * FROM courses ORDER BY year DESC, created_at ASC').all(),
     db.prepare('SELECT * FROM groups ORDER BY seq ASC').all(),
     db.prepare('SELECT * FROM students ORDER BY seq ASC').all(),
     db.prepare('SELECT course_id FROM group_snapshots').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM notices ORDER BY created_at DESC').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM attendance_sessions ORDER BY date DESC, created_at DESC').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM attendance_records').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM attendance_unlocks').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM attendance_delegates').all().catch(() => ({ results: [] })),
   ]);
   const snapshotSet = new Set((snapshots.results || []).map(r => r.course_id));
-  return courses.results.map(c => {
+  const result = courses.results.map(c => {
     const courseGroups = groups.results.filter(g => g.course_id === c.id).map(g => ({
       id: g.id,
       name: g.name,
@@ -255,12 +357,56 @@ export async function loadState(db) {
       isLeader: !!s.is_leader, isVice: !!s.is_vice, autoAssigned: !!s.auto_assigned,
       peerPenalty: Number(s.peer_penalty) || 0,
       peerComment: s.peer_comment || '',
+      passwordHash: s.password_hash || '',
+      hasCustomPassword: !!s.password_hash,
     }));
 
-    const courseNotices = notices.results
+    const courseNotices = (notices.results || [])
       .filter(n => n.course_id === c.id)
       .map(n => ({ id: n.id, content: n.content, time: n.time_str || '' }));
 
+    const courseSessions = (attSessions.results || [])
+      .filter(s => s.course_id === c.id)
+      .map(s => ({
+        id: s.id,
+        date: s.date,
+        timeSlot: s.time_slot || '',
+        name: s.name || '',
+        isDaily: s.id.startsWith('daily-') || s.name === '一般日常點名' || s.name === '日常點名',
+        createdAt: s.created_at || 0,
+      }));
+
+    const courseRecords = (attRecords.results || [])
+      .filter(r => r.course_id === c.id)
+      .map(r => ({
+        sessionId: r.session_id,
+        studentId: r.student_id,
+        groupId: r.group_id || '',
+        status: r.status || 'present',
+        markedById: r.marked_by_id || '',
+        markedByName: r.marked_by_name || '',
+        createdAt: r.created_at || 0,
+        updatedAt: r.updated_at || r.created_at || 0,
+      }));
+
+    const courseUnlocks = (attUnlocks.results || [])
+      .filter(u => u.course_id === c.id)
+      .map(u => ({
+        sessionId: u.session_id,
+        groupId: u.group_id || '',
+        deadline: u.deadline || '',
+        createdAt: u.created_at || 0,
+      }));
+
+    const courseDelegates = (attDelegates.results || [])
+      .filter(d => d.course_id === c.id)
+      .map(d => ({
+        sessionId: d.session_id,
+        groupId: d.group_id,
+        delegateId: d.delegate_id,
+        delegateName: d.delegate_name || '',
+        createdAt: d.created_at || 0,
+      }));
     // 計算每位同學的調分結果
     const courseObj = {
       id: c.id, year: c.year, subject: c.subject,
@@ -270,6 +416,10 @@ export async function loadState(db) {
       hasSnapshot: snapshotSet.has(c.id),
       groups: courseGroups,
       students: courseStudents,
+      attendanceSessions: courseSessions,
+      attendanceRecords: courseRecords,
+      attendanceUnlocks: courseUnlocks,
+      attendanceDelegates: courseDelegates,
     };
 
     courseStudents.forEach(s => {
@@ -279,6 +429,10 @@ export async function loadState(db) {
 
     return courseObj;
   });
+
+  _cachedRawCourses = structuredClone(result);
+  _cachedRawTime = Date.now();
+  return result;
 }
 
 export const cap = c => Number(c.groupSize) + Number(c.tolerance);
@@ -364,18 +518,26 @@ export async function publicize(db, env, courses, session) {
   const hmacKey = await getHmacKey(db, env);
   const out = [];
   for (const c of courses) {
-    // 期末組長評分僅老師看得到：一般同學／未登入者一律隱藏調分與加分細節，
-    // 僅組長本人可在自己組內看到（評分作業所需），供其填寫／檢視評分表單。
     let leaderGroupId = null;
+    let myGroupId = null;
+    const delegatedGroupIds = new Set();
+
     if (selfId && c.id === selfCourse) {
       const selfRec = c.students.find(s => s.id === selfId);
-      if (selfRec && selfRec.isLeader && selfRec.groupId) leaderGroupId = selfRec.groupId;
+      if (selfRec) {
+        myGroupId = selfRec.groupId;
+        if (selfRec.isLeader && selfRec.groupId) leaderGroupId = selfRec.groupId;
+      }
+      (c.attendanceDelegates || []).forEach(d => {
+        if (d.delegateId === selfId) delegatedGroupIds.add(d.groupId);
+      });
     }
+
     const students = [];
     for (const s of c.students) {
       const mine = selfId && s.id === selfId && c.id === selfCourse;
       const isMyGroupMember = leaderGroupId && s.groupId === leaderGroupId;
-      const { adjustment, peerPenalty, peerComment, ...rest } = s;
+      const { adjustment, peerPenalty, peerComment, passwordHash, ...rest } = s;
       students.push({
         ...rest,
         ...(isMyGroupMember ? { peerPenalty, peerComment } : {}),
@@ -383,8 +545,26 @@ export async function publicize(db, env, courses, session) {
         ref: await studentRef(db, env, c.id, s.id, hmacKey),
       });
     }
+
+    // 處理出缺席紀錄遮蔽：本人、所屬組別或被授權代理之組別可看見完整學號；其餘遮蔽以保障隱私
+    const attendanceRecords = (c.attendanceRecords || []).map(r => {
+      const canSeeRaw = (selfId && c.id === selfCourse) && (
+        r.studentId === selfId ||
+        (myGroupId && r.groupId === myGroupId) ||
+        delegatedGroupIds.has(r.groupId)
+      );
+      return {
+        ...r,
+        studentId: canSeeRaw ? r.studentId : maskId(r.studentId),
+      };
+    });
+
     const { logs, ...courseWithoutLogs } = c;
-    out.push({ ...courseWithoutLogs, students });
+    out.push({
+      ...courseWithoutLogs,
+      students,
+      attendanceRecords,
+    });
   }
   return out;
 }

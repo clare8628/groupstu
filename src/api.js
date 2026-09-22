@@ -1,9 +1,11 @@
-export const API_VERSION = 'v2.2.0 (2026.09.21-1710)';
+export const API_VERSION = 'v2.5.0 (2026.09.22-1324)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
   applyDeadline, publicize, resolveStudent, canGroupLeaderEdit, DEFAULT_NOTICE, addLog,
   fetchCourseLogs,
+  todayDateStr, isDailySession, attendanceUnlockFor, isAttendanceEditable,
+  invalidateStateCache as invalidateLibCache,
 } from './lib.js';
 
 // 短暫記憶體快取防護（針對公開未登入/學生輪詢，有效緩解 D1 讀取消耗）
@@ -14,6 +16,7 @@ const CACHE_TTL_MS = 5000; // 5 秒防護期
 export function invalidateStateCache() {
   _stateCache = null;
   _stateCacheExpiry = 0;
+  if (typeof invalidateLibCache === 'function') invalidateLibCache();
 }
 
 /* GET /api/state — 公開讀取全部課程／名單／分組 */
@@ -85,8 +88,19 @@ export async function handleAction(request, env, db, body) {
   if (action === 'login-student') {
     const c = course(body.courseId);
     if (!c) return bad('課程不存在 Course not found', 404);
-    const s = c.students.find(x => x.name === String(body.name || '').trim() && x.id === String(body.sid || '').trim());
+    const account = String(body.account || body.name || '').trim();
+    const password = String(body.password || body.sid || '').trim();
+    const s = c.students.find(x => x.id === account || x.name === account || (x.name === String(body.name || '').trim() && x.id === String(body.sid || '').trim()));
     if (!s) return bad('姓名或學號不正確，或不在本課程修課名單中', 401);
+
+    // 比對密碼：若已自訂密碼則比對 SHA-256 雜湊，否則預設密碼為學號
+    if (s.passwordHash) {
+      const hashed = await sha256(password);
+      if (hashed !== s.passwordHash) return bad('密碼錯誤 Wrong password', 401);
+    } else {
+      if (password !== s.id) return bad('密碼錯誤（預設為學號）Wrong password', 401);
+    }
+
     const token = await makeToken(db, env, { role: 'student', id: s.id, courseId: c.id });
     return ok({ session: { role: 'student', id: s.id, courseId: c.id } }, { 'set-cookie': sessionCookie(token) });
   }
@@ -422,9 +436,132 @@ export async function handleAction(request, env, db, body) {
       }
 
       if (stmts.length) await db.batch(stmts);
+      invalidateStateCache();
       await addLog(db, c.id, '老師', 'teacher-auto-assign', `隨機分配剩餘 ${unassignedStudents.length} 位未分組學生`);
       return ok();
     }
+
+    /* ---- 點名管理（老師） ---- */
+    if (op === 'save-attendance-session') {
+      const c = course(body.courseId);
+      if (!c) return bad('課程不存在', 404);
+      const now = Date.now();
+      const id = body.id || ('sess_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+      const date = String(body.date || todayDateStr()).trim();
+      const timeSlot = String(body.timeSlot || '').trim();
+      const name = String(body.name || '').trim();
+      if (!name) return bad('請填寫點名時段名稱', 400);
+
+      await db.prepare(`
+        INSERT OR REPLACE INTO attendance_sessions (id, course_id, date, time_slot, name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).bind(id, c.id, date, timeSlot, name, now).run();
+
+      invalidateStateCache();
+      await addLog(db, c.id, '老師', 'attendance-session-save', `儲存點名時段：「${name}」（日期：${date}${timeSlot ? '，' + timeSlot : ''}）`);
+      return ok();
+    }
+
+    if (op === 'del-attendance-session') {
+      const c = course(body.courseId);
+      if (!c) return bad('課程不存在', 404);
+      const sessionId = body.sessionId;
+      if (!sessionId) return bad('缺少時段 ID', 400);
+
+      const sess = (c.attendanceSessions || []).find(s => s.id === sessionId);
+      const sessName = sess ? sess.name : sessionId;
+
+      await db.batch([
+        db.prepare('DELETE FROM attendance_records WHERE course_id = ? AND session_id = ?').bind(c.id, sessionId),
+        db.prepare('DELETE FROM attendance_unlocks WHERE course_id = ? AND session_id = ?').bind(c.id, sessionId),
+        db.prepare('DELETE FROM attendance_delegates WHERE course_id = ? AND session_id = ?').bind(c.id, sessionId),
+        db.prepare('DELETE FROM attendance_sessions WHERE course_id = ? AND id = ?').bind(c.id, sessionId),
+      ]);
+
+      invalidateStateCache();
+      await addLog(db, c.id, '老師', 'attendance-session-delete', `刪除點名時段：「${sessName}」及其相關紀錄`);
+      return ok();
+    }
+
+    if (op === 'set-attendance-unlock') {
+      const c = course(body.courseId);
+      if (!c) return bad('課程不存在', 404);
+      const { sessionId, groupId = '', allow, deadline = '' } = body;
+      if (!sessionId) return bad('缺少時段 ID', 400);
+
+      const sess = (c.attendanceSessions || []).find(s => s.id === sessionId);
+      const sessName = sess ? sess.name : sessionId;
+      const targetGroup = groupId ? c.groups.find(g => g.id === groupId) : null;
+      const scopeLabel = targetGroup ? targetGroup.name : '全班所有組別';
+
+      if (allow) {
+        await db.prepare(`
+          INSERT OR REPLACE INTO attendance_unlocks (course_id, session_id, group_id, deadline, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(c.id, sessionId, groupId, String(deadline || ''), Date.now()).run();
+        invalidateStateCache();
+        await addLog(db, c.id, '老師', 'attendance-unlock', `開放「${sessName}」針對【${scopeLabel}】補登點名${deadline ? '（截止時間：' + deadline.replace('T', ' ') + '）' : ''}`);
+      } else {
+        await db.prepare('DELETE FROM attendance_unlocks WHERE course_id = ? AND session_id = ? AND group_id = ?')
+          .bind(c.id, sessionId, groupId).run();
+        invalidateStateCache();
+        await addLog(db, c.id, '老師', 'attendance-unlock', `關閉「${sessName}」針對【${scopeLabel}】之補登權限`);
+      }
+      return ok();
+    }
+
+    if (op === 'set-attendance-delegate') {
+      const c = course(body.courseId);
+      if (!c) return bad('課程不存在', 404);
+      const { sessionId, groupId, delegateId, allow } = body;
+      if (!sessionId || !groupId || !delegateId) return bad('缺少參數', 400);
+
+      const sess = (c.attendanceSessions || []).find(s => s.id === sessionId);
+      const sessName = sess ? sess.name : sessionId;
+      const group = c.groups.find(g => g.id === groupId);
+      const groupName = group ? group.name : groupId;
+      const delegateStudent = c.students.find(s => s.id === delegateId);
+      const delegateName = delegateStudent ? delegateStudent.name : delegateId;
+
+      if (allow) {
+        await db.prepare(`
+          INSERT OR REPLACE INTO attendance_delegates (course_id, session_id, group_id, delegate_id, delegate_name, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(c.id, sessionId, groupId, delegateId, delegateName, Date.now()).run();
+        invalidateStateCache();
+        await addLog(db, c.id, '老師', 'attendance-delegate', `於「${sessName}」指派 ${delegateName} (${delegateId}) 代理【${groupName}】點名`);
+      } else {
+        await db.prepare('DELETE FROM attendance_delegates WHERE course_id = ? AND session_id = ? AND group_id = ? AND delegate_id = ?')
+          .bind(c.id, sessionId, groupId, delegateId).run();
+        invalidateStateCache();
+        await addLog(db, c.id, '老師', 'attendance-delegate', `於「${sessName}」撤銷 ${delegateName} 代理【${groupName}】點名`);
+      }
+      return ok();
+    }
+
+    if (op === 'change-student-password') {
+      const c = course(body.courseId);
+      if (!c) return bad('課程不存在', 404);
+      const student = c.students.find(s => s.id === body.studentId);
+      if (!student) return bad('學生不存在', 404);
+
+      if (body.resetToDefault) {
+        await db.prepare('UPDATE students SET password_hash = \'\' WHERE course_id = ? AND id = ?')
+          .bind(c.id, student.id).run();
+        invalidateStateCache();
+        await addLog(db, c.id, '老師', 'password-reset', `將幹部 ${student.name} (${student.id}) 密碼重設為預設學號`);
+      } else {
+        const next = String(body.next || '');
+        if (next.length < 4) return bad('密碼至少需 4 碼', 400);
+        const hashed = await sha256(next);
+        await db.prepare('UPDATE students SET password_hash = ? WHERE course_id = ? AND id = ?')
+          .bind(hashed, c.id, student.id).run();
+        invalidateStateCache();
+        await addLog(db, c.id, '老師', 'password-reset', `為幹部 ${student.name} (${student.id}) 指派新密碼`);
+      }
+      return ok();
+    }
+
     return bad('未知操作 Unknown action: ' + op, 400);
   }
 
@@ -540,5 +677,139 @@ export async function handleAction(request, env, db, body) {
     await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'toggle-vice', `將組員 ${t.name} (${t.id}) ${on ? '指定為' : '解除'} ${groupName} 副組長`);
     return ok();
   }
+  if (action === 'change-student-password') {
+    if (!self.isLeader && !self.isVice) return bad('僅組長或副組長可修改個人密碼 Leader or vice leader only', 403);
+    const curPw = String(body.current || '');
+    const nextPw = String(body.next || '');
+    if (nextPw.length < 4) return bad('新密碼長度至少需 4 碼 Password at least 4 chars', 400);
+
+    if (self.passwordHash) {
+      if (await sha256(curPw) !== self.passwordHash) return bad('目前密碼錯誤 Incorrect current password', 401);
+    } else {
+      if (curPw !== self.id) return bad('目前密碼錯誤（預設為學號）Incorrect current password', 401);
+    }
+
+    const newHash = await sha256(nextPw);
+    await db.prepare('UPDATE students SET password_hash = ? WHERE course_id = ? AND id = ?')
+      .bind(newHash, c.id, self.id).run();
+    invalidateStateCache();
+    const roleLabel = self.isLeader ? '組長' : '副組長';
+    await addLog(db, c.id, `${roleLabel} ${self.name} (${self.id})`, 'change-password', `${roleLabel} 自行更新了登入密碼`);
+    return ok();
+  }
+
+  if (action === 'mark-attendance') {
+    const { sessionId, groupId, records } = body;
+    if (!sessionId || !groupId || !Array.isArray(records)) return bad('缺少必要點名參數 Missing params', 400);
+
+    const now = Date.now();
+    const today = todayDateStr();
+
+    // 1. 驗證身分：操作者必須為組長、副組長，或被指派跨組代理
+    let isDelegate = (c.attendanceDelegates || []).some(d =>
+      d.sessionId === sessionId && d.groupId === groupId && d.delegateId === self.id
+    );
+
+    if (!isDelegate) {
+      if (self.groupId !== groupId) return bad('您非該組成員，且未獲授權代理該組點名 Not authorized for this group', 403);
+      if (!self.isLeader && !self.isVice) return bad('僅組長或副組長可執行點名 Leader or vice leader only', 403);
+    }
+
+    // 2. 檢驗時段與日常點名推導
+    let sessionObj = (c.attendanceSessions || []).find(s => s.id === sessionId);
+    if (!sessionObj && (sessionId === `daily-${today}` || sessionId === 'daily' || sessionId.startsWith('daily-'))) {
+      const sessionDate = sessionId.startsWith('daily-') ? sessionId.slice(6) : today;
+      sessionObj = {
+        id: sessionId.startsWith('daily-') ? sessionId : `daily-${today}`,
+        courseId: c.id,
+        date: sessionDate,
+        timeSlot: '',
+        name: '一般日常點名',
+        isDaily: true,
+        createdAt: now,
+      };
+    }
+    if (!sessionObj) return bad('點名時段不存在 Session not found', 404);
+
+    // 3. 檢查時效性與補登解鎖
+    if (!isDelegate) {
+      if (!isAttendanceEditable(sessionObj, c.attendanceUnlocks || [], groupId)) {
+        return bad('已超過當日，點名紀錄已鎖定，需老師開放補登權限 Locked, ask teacher to unlock', 403);
+      }
+    }
+
+    // 4. 確保時段已持久化至 attendance_sessions (INSERT OR IGNORE)
+    await db.prepare(`
+      INSERT OR IGNORE INTO attendance_sessions (id, course_id, date, time_slot, name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(sessionObj.id, c.id, sessionObj.date, sessionObj.timeSlot || '', sessionObj.name || '一般日常點名', sessionObj.createdAt || now).run();
+
+    // 5. 比對現有紀錄以記錄雙時間戳與日誌
+    const existingMap = new Map();
+    (c.attendanceRecords || []).forEach(r => {
+      if (r.sessionId === sessionObj.id && r.groupId === groupId) {
+        existingMap.set(r.studentId, r);
+      }
+    });
+
+    const stmts = [];
+    const roleLabel = self.isLeader ? '組長' : (self.isVice ? '副組長' : '代理人');
+    const delegateNote = isDelegate ? '（跨組代理）' : '';
+
+    for (const rec of records) {
+      const student = c.students.find(x => x.id === rec.studentId || x.ref === rec.studentId);
+      if (!student || student.groupId !== groupId) continue;
+
+      const status = rec.status === 'absent' ? 'absent' : 'present';
+      const prior = existingMap.get(student.id);
+      const createdAt = prior ? (prior.createdAt || now) : now;
+
+      stmts.push(
+        db.prepare(`
+          INSERT OR REPLACE INTO attendance_records
+          (course_id, session_id, student_id, group_id, status, marked_by_id, marked_by_name, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(c.id, sessionObj.id, student.id, groupId, status, self.id, self.name, createdAt, now)
+      );
+
+      // 異動日誌
+      if (!prior) {
+        const timeStr = new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+        const logId = 'log_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+        stmts.push(
+          db.prepare('INSERT INTO activity_logs (id, course_id, operator, action, details, created_at, time_str) VALUES (?,?,?,?,?,?,?)')
+            .bind(
+              logId,
+              c.id,
+              `${roleLabel} ${self.name} (${self.id})${delegateNote}`,
+              'attendance-mark',
+              `於「${sessionObj.name}」完成點名，標記 ${student.name} (${student.id}) 為「${status === 'absent' ? '缺席' : '出席'}」`,
+              now,
+              timeStr
+            )
+        );
+      } else if (prior.status !== status) {
+        const timeStr = new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+        const logId = 'log_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+        stmts.push(
+          db.prepare('INSERT INTO activity_logs (id, course_id, operator, action, details, created_at, time_str) VALUES (?,?,?,?,?,?,?)')
+            .bind(
+              logId,
+              c.id,
+              `${roleLabel} ${self.name} (${self.id})${delegateNote}`,
+              'attendance-correct',
+              `修正「${sessionObj.name}」點名，將 ${student.name} (${student.id}) 由「${prior.status === 'absent' ? '缺席' : '出席'}」改為「${status === 'absent' ? '缺席' : '出席'}」`,
+              now,
+              timeStr
+            )
+        );
+      }
+    }
+
+    if (stmts.length) await db.batch(stmts);
+    invalidateStateCache();
+    return ok();
+  }
+
   return bad('未知操作 Unknown action: ' + action, 400);
 }

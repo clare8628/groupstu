@@ -15,7 +15,7 @@ const min = pad(now.getUTCMinutes());
 
 const verDate = `${yyyy}.${mm}.${dd}-${hh}${min}`;
 const verNum = `${yyyy}${mm}${dd}${hh}${min}`;
-const appVerString = `v2.6.2 (${verDate})`;
+const appVerString = `v2.6.3 (${verDate})`;
 
 console.log(`[bump-version] 更新版本號為: ${appVerString} (快取標籤: ${verNum})`);
 

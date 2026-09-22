@@ -224,11 +224,18 @@ export function getNextAvailableGroupNumbers(existingGroups, count = 1) {
  * 3. 確保組別既不重複、又填補缺號。
  */
 export async function cleanupDuplicateAndEmptyGroups(db, specificCourseId = null) {
-  const coursesQuery = specificCourseId 
-    ? db.prepare('SELECT id FROM courses WHERE id = ?').bind(specificCourseId)
-    : db.prepare('SELECT id FROM courses');
-  const { results: courses } = await coursesQuery.all();
-  if (!courses || !courses.length) return { totalRemoved: 0, totalRenamed: 0, details: [] };
+  let courses = [];
+  try {
+    const q = specificCourseId 
+      ? db.prepare('SELECT id FROM courses WHERE id = ?').bind(specificCourseId)
+      : db.prepare('SELECT id FROM courses');
+    const r = await q.all();
+    courses = (r && r.results) || [];
+  } catch (e) {
+    console.error('cleanup: courses query error', e);
+    return { totalRemoved: 0, totalRenamed: 0, details: [] };
+  }
+  if (!courses.length) return { totalRemoved: 0, totalRenamed: 0, details: [] };
 
   let totalRemoved = 0;
   let totalRenamed = 0;
@@ -236,11 +243,11 @@ export async function cleanupDuplicateAndEmptyGroups(db, specificCourseId = null
 
   for (const c of courses) {
     const [groupsRes, studentsRes] = await Promise.all([
-      db.prepare('SELECT id, name, seq FROM groups WHERE course_id = ? ORDER BY seq ASC').bind(c.id).all(),
-      db.prepare('SELECT id, group_id, is_leader FROM students WHERE course_id = ?').bind(c.id).all(),
+      db.prepare('SELECT id, name, seq FROM groups WHERE course_id = ? ORDER BY seq ASC').bind(c.id).all().catch(() => ({ results: [] })),
+      db.prepare('SELECT id, group_id, is_leader FROM students WHERE course_id = ?').bind(c.id).all().catch(() => ({ results: [] })),
     ]);
-    const groups = groupsRes.results || [];
-    const students = studentsRes.results || [];
+    const groups = (groupsRes && groupsRes.results) || [];
+    const students = (studentsRes && studentsRes.results) || [];
 
     const memberCounts = {};
     const leaderCounts = {};
@@ -344,10 +351,8 @@ export async function cleanupDuplicateAndEmptyGroups(db, specificCourseId = null
  * 將現有組別依自然順序重新命名為第 1 組、第 2 組 ... 第 N 組，消除因中途刪組留下的大號缺漏。
  */
 export async function renumberGroupsSequentially(db, courseId) {
-  const [groupsRes] = await Promise.all([
-    db.prepare('SELECT id, name, seq FROM groups WHERE course_id = ? ORDER BY seq ASC').bind(courseId).all(),
-  ]);
-  const groups = groupsRes.results || [];
+  const groupsRes = await db.prepare('SELECT id, name, seq FROM groups WHERE course_id = ? ORDER BY seq ASC').bind(courseId).all().catch(() => ({ results: [] }));
+  const groups = (groupsRes && groupsRes.results) || [];
   if (!groups.length) return { updated: 0 };
 
   // 自然排序
@@ -560,12 +565,17 @@ export async function loadState(db) {
   }
   if (hasDuplicateGroups) {
     await cleanupDuplicateAndEmptyGroups(db);
-    groups.results = (await db.prepare('SELECT * FROM groups ORDER BY seq ASC').all()).results || [];
+    const refreshed = await db.prepare('SELECT * FROM groups ORDER BY seq ASC').all().catch(() => ({ results: [] }));
+    groups.results = (refreshed && refreshed.results) || [];
   }
 
-  const snapshotSet = new Set((snapshots.results || []).map(r => r.course_id));
-  const result = courses.results.map(c => {
-    const courseGroups = groups.results.filter(g => g.course_id === c.id).map(g => ({
+  const snapshotSet = new Set(((snapshots && snapshots.results) || []).map(r => r.course_id));
+  const courseList = (courses && courses.results) || [];
+  const allGroups = (groups && groups.results) || [];
+  const allStudents = (students && students.results) || [];
+
+  const result = courseList.map(c => {
+    const courseGroups = allGroups.filter(g => g.course_id === c.id).map(g => ({
       id: g.id,
       name: g.name,
       allowEdit: !!g.allow_edit,
@@ -582,7 +592,7 @@ export async function loadState(db) {
       if (nb !== null) return 1;
       return (a.seq || 0) - (b.seq || 0);
     });
-    const courseStudents = students.results.filter(s => s.course_id === c.id).map(s => ({
+    const courseStudents = allStudents.filter(s => s.course_id === c.id).map(s => ({
       id: s.id, name: s.name, groupId: s.group_id,
       isLeader: !!s.is_leader, isVice: !!s.is_vice, autoAssigned: !!s.auto_assigned,
       peerPenalty: Number(s.peer_penalty) || 0,

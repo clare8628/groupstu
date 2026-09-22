@@ -332,6 +332,27 @@ export async function cleanupDuplicateAndEmptyGroups(db, specificCourseId = null
       });
     }
 
+    // 保留之組別依序平滑緊縮連續化（1 ~ N），消除歷史跳號與缺號（如 11, 16 缺號）
+    preservedGroups.sort((a, b) => {
+      const na = parseGroupNumber(a.name);
+      const nb = parseGroupNumber(b.name);
+      if (na !== null && nb !== null) return na - nb;
+      if (na !== null) return -1;
+      if (nb !== null) return 1;
+      return (a.seq || 0) - (b.seq || 0);
+    });
+
+    preservedGroups.forEach((g, idx) => {
+      const targetName = `第 ${idx + 1} 組`;
+      const targetSeq = idx + 1;
+      if (g.name !== targetName || g.seq !== targetSeq) {
+        stmts.push(db.prepare('UPDATE groups SET name = ?, seq = ? WHERE course_id = ? AND id = ?').bind(targetName, targetSeq, c.id, g.id));
+        g.name = targetName;
+        g.seq = targetSeq;
+        totalRenamed++;
+      }
+    });
+
     if (stmts.length > 0) {
       for (let i = 0; i < stmts.length; i += 50) {
         await db.batch(stmts.slice(i, i + 50));
@@ -553,18 +574,41 @@ export async function loadState(db) {
     db.prepare('SELECT * FROM attendance_delegates').all().catch(() => ({ results: [] })),
   ]);
 
-  // 自動檢測重複組別：若資料庫內存在同名重複組別，即時自動自癒修復
-  const seenGroupKeys = new Set();
-  let hasDuplicateGroups = false;
+  // 自動檢測組別編號異常：同名重複、空組或序號缺號中斷，即時自動自癒修復
+  let needsHealing = false;
+  const courseGroupMap = new Map();
   for (const g of (groups.results || [])) {
-    const k = g.course_id + '::' + g.name;
-    if (seenGroupKeys.has(k)) {
-      hasDuplicateGroups = true;
-      break;
-    }
-    seenGroupKeys.add(k);
+    if (!courseGroupMap.has(g.course_id)) courseGroupMap.set(g.course_id, []);
+    courseGroupMap.get(g.course_id).push(g);
   }
-  if (hasDuplicateGroups) {
+
+  for (const [cid, cGroups] of courseGroupMap.entries()) {
+    const seenNames = new Set();
+    const nums = [];
+    for (const g of cGroups) {
+      if (seenNames.has(g.name)) {
+        needsHealing = true;
+        break;
+      }
+      seenNames.add(g.name);
+      const num = parseGroupNumber(g.name);
+      if (num !== null) nums.push(num);
+    }
+    if (needsHealing) break;
+    // 檢查是否有缺號（如總共 15 組卻出現 17 號，缺 11, 16）
+    if (nums.length > 0 && nums.length === cGroups.length) {
+      nums.sort((a, b) => a - b);
+      for (let i = 0; i < nums.length; i++) {
+        if (nums[i] !== i + 1) {
+          needsHealing = true;
+          break;
+        }
+      }
+    }
+    if (needsHealing) break;
+  }
+
+  if (needsHealing) {
     await cleanupDuplicateAndEmptyGroups(db);
     const refreshed = await db.prepare('SELECT * FROM groups ORDER BY seq ASC').all().catch(() => ({ results: [] }));
     groups.results = (refreshed && refreshed.results) || [];
@@ -817,6 +861,8 @@ export async function smartAutoAssign(db, c, operatorName = '老師') {
     }
   }
 
+  // 確保分配後組別編號平滑連續無缺漏
+  await cleanupDuplicateAndEmptyGroups(db, c.id);
   invalidateStateCache();
 
   const logDesc = `一鍵自動分配未分組學生：優先填補 ${filledCount} 人至未達門檻組別` +

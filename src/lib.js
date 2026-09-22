@@ -542,9 +542,9 @@ export async function loadState(db) {
 
   await ensureGroupSchema(db);
   const [courses, groups, students, snapshots, notices, attSessions, attRecords, attUnlocks, attDelegates] = await Promise.all([
-    db.prepare('SELECT * FROM courses ORDER BY year DESC, created_at ASC').all(),
-    db.prepare('SELECT * FROM groups ORDER BY seq ASC').all(),
-    db.prepare('SELECT * FROM students ORDER BY seq ASC').all(),
+    db.prepare('SELECT * FROM courses ORDER BY year DESC, created_at ASC').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM groups ORDER BY seq ASC').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM students ORDER BY seq ASC').all().catch(() => ({ results: [] })),
     db.prepare('SELECT course_id FROM group_snapshots').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM notices ORDER BY created_at DESC').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM attendance_sessions ORDER BY date DESC, created_at DESC').all().catch(() => ({ results: [] })),
@@ -701,12 +701,12 @@ export const nextSeq = async (db, table, courseId) => {
 
 export async function saveSnapshot(db, courseId) {
   const [snapGroups, snapStudents] = await Promise.all([
-    db.prepare('SELECT id, course_id, name, seq, allow_edit, edit_deadline, peer_eval_open, peer_eval_deadline, peer_eval_submitted FROM groups WHERE course_id = ?').bind(courseId).all(),
-    db.prepare('SELECT id, group_id, is_leader, is_vice, auto_assigned, peer_penalty, peer_comment FROM students WHERE course_id = ?').bind(courseId).all(),
+    db.prepare('SELECT id, course_id, name, seq, allow_edit, edit_deadline, peer_eval_open, peer_eval_deadline, peer_eval_submitted FROM groups WHERE course_id = ?').bind(courseId).all().catch(() => ({ results: [] })),
+    db.prepare('SELECT id, group_id, is_leader, is_vice, auto_assigned, peer_penalty, peer_comment FROM students WHERE course_id = ?').bind(courseId).all().catch(() => ({ results: [] })),
   ]);
   const payload = JSON.stringify({
-    groups: snapGroups.results || [],
-    students: snapStudents.results || [],
+    groups: (snapGroups && snapGroups.results) || [],
+    students: (snapStudents && snapStudents.results) || [],
   });
   await db.prepare('INSERT OR REPLACE INTO group_snapshots (course_id, snapshot, created_at) VALUES (?, ?, ?)')
     .bind(courseId, payload, Date.now()).run();

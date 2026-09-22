@@ -1,4 +1,4 @@
-export const API_VERSION = 'v2.6.3 (2026.09.22-1457)';
+export const API_VERSION = 'v2.6.4 (2026.09.22-1459)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,

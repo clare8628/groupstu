@@ -15,7 +15,8 @@ export default {
         if (url.pathname === '/api/action' && request.method === 'POST') return await handleAction(request, env, db, await request.json());
         return bad('Not found', 404);
       } catch (err) {
-        return bad(String((err && err.message) || err), 500);
+        console.error(err);
+        return bad(String((err && err.stack) || (err && err.message) || err), 500);
       }
     }
 

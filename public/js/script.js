@@ -1,6 +1,6 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.6.3 (2026.09.22-1457)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.6.4 (2026.09.22-1459)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失

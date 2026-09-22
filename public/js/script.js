@@ -1,6 +1,6 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.5.0 (2026.09.22-1324)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.6.0 (2026.09.22-1411)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
@@ -1962,38 +1962,119 @@ function teacherCourse(c) {
   ${bulletinAdminBlock(c)}
 
   <div class="teacher-section">
-    <h2>分組管理 Grouping</h2>
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;margin-bottom:1rem;">
+      <h2 style="margin:0;">分組管理 Grouping</h2>
+      <span class="file-path" style="margin:0;">每組人數目標：<b>${c.groupSize}</b> 人（彈性門檻：<b>${minCap(c)} ~ ${cap(c)}</b> 人）</span>
+    </div>
 
-    <!-- 分組截止時間設定 (置於分組管理區塊開頭) -->
-    <form data-act="set-course-deadline" class="grouping-deadline-bar">
-      <label>⏳ 分組截止時間 Deadline：</label>
-      <input type="datetime-local" name="deadline" value="${esc(c.deadline || '')}">
-      <button class="btn btn-primary" type="submit" style="padding:0.4rem 1rem;font-size:0.85rem;margin:0;">儲存截止時間</button>
-      ${c.deadline ? `
-        <span class="deadline-status-tag ${deadlinePassed(c) ? 'closed' : 'open'}">
-          ${deadlinePassed(c) ? '🚫 已截止（未選學生已自動分配）Closed' : '🟢 分組進行中 Open'}
-        </span>
-      ` : '<span style="font-size:0.82rem;color:#64748b;">(尚未設定截止時間)</span>'}
-    </form>
-
-    <div class="stats">
+    <!-- 人數統計概覽 -->
+    <div class="stats" style="margin-bottom:1.5rem;">
       <div class="stat"><div class="value">${total}</div><div class="label">總學生數 Students</div></div>
       <div class="stat"><div class="value">${c.groups.length}</div><div class="label">組別數 Groups</div></div>
       <div class="stat"><div class="value">${assigned}</div><div class="label">已分組 Assigned</div></div>
-      <div class="stat"><div class="value">${total - assigned}</div><div class="label">未分組 Unassigned</div></div>
+      <div class="stat"><div class="value" style="color:${total - assigned > 0 ? '#ea580c' : '#16a34a'};">${total - assigned}</div><div class="label">未分組 Unassigned</div></div>
     </div>
-    <div class="btn-row">
-      <button class="btn btn-primary" data-act="make-groups" title="將重設並清空現有所有分組">建立空組別（清空現有）Create groups</button>
-      <button class="btn btn-success" data-act="make-remaining-groups" title="只針對未分組成員依規定人數建立新組別，現有組別與成員不變">針對剩餘組員建立組別 Create for unassigned</button>
-      <button class="btn btn-secondary" data-act="add-group">新增一組 Add group</button>
-      <button class="btn btn-secondary" data-act="auto-assign" title="隨機分配未分組學生，避開已完成編組的組別，不新增或刪減已完成分組的組別成員">隨機分配剩餘 Auto-assign</button>
-      <button class="btn btn-danger" data-act="clear-groups">清除本科目所有分組 Clear all groups</button>
-      ${c.hasSnapshot ? `
-        <button class="btn btn-undo" data-act="restore-snapshot" title="復原至上次清空或建立組別前的分組狀態">↩️ 回到上一步 (復原分組) Undo</button>
-      ` : ''}
-      <button class="btn btn-secondary" data-act="goto-course-logs" data-id="${c.id}" title="前往本科目分組異動日誌">📋 分組異動日誌${courseLogsCache && courseLogsCache[c.id] ? ` (${courseLogsCache[c.id].length})` : ''}</button>
-      <button class="btn btn-secondary" data-act="export-json">匯出 JSON</button>
-      <button class="btn btn-secondary" data-act="export-csv" title="匯出全體學生期末評分結果，依學號由小到大排序">匯出評分成績 CSV（依學號排序）</button>
+
+    <!-- 三大分類卡片佈局 -->
+    <div class="grouping-cards-grid" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:1.25rem;">
+      
+      <!-- 卡片 1: 🎲 智慧自動分配與截止管理 (Smart Automated Allocation & Deadline) -->
+      <div class="grouping-card smart-alloc" style="background:#f0f9ff;border:1.5px solid #bae6fd;border-radius:10px;padding:1.2rem;display:flex;flex-direction:column;justify-content:space-between;">
+        <div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;margin-bottom:0.6rem;">
+            <h3 style="margin:0;font-size:1.05rem;color:#0369a1;display:flex;align-items:center;gap:0.4rem;">
+              <span>🎲</span> 智慧自動分配與截止管理
+            </h3>
+            <span class="tag-inline" style="background:#e0f2fe;border-color:#7dd3fc;color:#0284c7;font-size:0.75rem;">一鍵 / 到期分配</span>
+          </div>
+          <p style="margin:0 0 0.85rem 0;font-size:0.84rem;color:#334155;line-height:1.45;">
+            優先隨機填補未達最低門檻（&lt; ${minCap(c)}人）的組別；扣除後依每組人數（${c.groupSize}人）自動建立新組別，並將剩餘學生平均隨機分入。
+          </p>
+
+          <!-- 截止時間表單 -->
+          <form data-act="set-course-deadline" class="grouping-deadline-bar" style="margin-bottom:0.75rem;padding:0.6rem 0.8rem;background:#fff;border:1px solid #e2e8f0;border-radius:8px;">
+            <label style="font-size:0.82rem;font-weight:600;color:#475569;">⏳ 全體分組截止時間：</label>
+            <div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;margin-top:0.3rem;">
+              <input type="datetime-local" name="deadline" value="${esc(c.deadline || '')}" style="padding:0.3rem 0.5rem;font-size:0.82rem;border:1px solid var(--border);border-radius:5px;">
+              <button class="btn btn-secondary" type="submit" style="padding:0.3rem 0.75rem;font-size:0.82rem;margin:0;">儲存截止時間</button>
+            </div>
+            <div style="margin-top:0.4rem;font-size:0.78rem;">
+              ${c.deadline ? `
+                <span class="deadline-status-tag ${deadlinePassed(c) ? 'closed' : 'open'}" style="font-size:0.75rem;">
+                  ${deadlinePassed(c) ? '🚫 已截止（到達截止時間系統已自動分配）' : '🟢 倒數進行中（到期系統將自動觸發一次分配）'}
+                </span>
+              ` : '<span style="color:#94a3b8;">（尚未設定截止時間，可隨時設定）</span>'}
+            </div>
+          </form>
+        </div>
+
+        <div style="margin-top:0.5rem;">
+          <button class="btn btn-primary" data-act="smart-auto-assign" style="width:100%;padding:0.65rem 1rem;background:#0284c7;border-color:#0284c7;font-weight:600;display:flex;align-items:center;justify-content:center;gap:0.4rem;" ${total - assigned === 0 ? 'disabled title="目前所有學生皆已完成分組"' : ''}>
+            <span>⚡</span> 一鍵自動補齊門檻並分配剩餘組員 (${total - assigned} 人未分組)
+          </button>
+        </div>
+      </div>
+
+      <!-- 卡片 2: 📐 組別架構維護與重設 (Structure & Reset) -->
+      <div class="grouping-card structure" style="background:var(--surface);border:1.5px solid var(--border);border-radius:10px;padding:1.2rem;display:flex;flex-direction:column;justify-content:space-between;">
+        <div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;margin-bottom:0.6rem;">
+            <h3 style="margin:0;font-size:1.05rem;color:var(--text);display:flex;align-items:center;gap:0.4rem;">
+              <span>📐</span> 組別架構維護與重設
+            </h3>
+            <span class="tag-inline" style="font-size:0.75rem;">架構控制</span>
+          </div>
+          <p style="margin:0 0 0.85rem 0;font-size:0.84rem;color:var(--text-muted);line-height:1.45;">
+            手動建立組別、依全班人數重建固定數量之預設空白組，或全面清空歸零重設。
+          </p>
+          <div style="display:flex;flex-direction:column;gap:0.6rem;">
+            <button class="btn btn-secondary" data-act="add-group" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
+              <span>➕</span> <span>手動新增一組 Add Group（現有 ${c.groups.length} 組）</span>
+            </button>
+            <button class="btn btn-secondary" data-act="make-groups" title="清空現有分組分配，並依人數重建 N 個空白組別" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
+              <span>🔄</span> <span>依人數重建預設空組別（清空分配並建 ${Math.max(1, Math.ceil(total / Math.max(1, c.groupSize)))} 組）</span>
+            </button>
+            <button class="btn btn-danger" data-act="clear-groups" title="將所有組別刪除歸零，全體學生變回未分組" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
+              <span>🗑️</span> <span>清空所有組別（歸零重設為 0 組）</span>
+            </button>
+          </div>
+        </div>
+
+        ${c.hasSnapshot ? `
+          <div style="margin-top:0.85rem;padding-top:0.75rem;border-top:1px dashed var(--border);">
+            <button class="btn btn-undo" data-act="restore-snapshot" style="width:100%;padding:0.5rem 0.8rem;display:flex;align-items:center;justify-content:center;gap:0.4rem;" title="復原至上次清空或建立組別前的分組狀態">
+              <span>↩️</span> 回到上一步 (復原分組狀態) Undo
+            </button>
+          </div>
+        ` : ''}
+      </div>
+
+      <!-- 卡片 3: 📊 異動日誌與數據匯出 (Logs & Export) -->
+      <div class="grouping-card export" style="background:var(--surface);border:1.5px solid var(--border);border-radius:10px;padding:1.2rem;display:flex;flex-direction:column;justify-content:space-between;">
+        <div>
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;margin-bottom:0.6rem;">
+            <h3 style="margin:0;font-size:1.05rem;color:var(--text);display:flex;align-items:center;gap:0.4rem;">
+              <span>📊</span> 異動日誌與數據匯出
+            </h3>
+            <span class="tag-inline" style="font-size:0.75rem;">歷程與報表</span>
+          </div>
+          <p style="margin:0 0 0.85rem 0;font-size:0.84rem;color:var(--text-muted);line-height:1.45;">
+            追蹤分組操作軌跡，或將組別與期末評分成績匯出備份。
+          </p>
+          <div style="display:flex;flex-direction:column;gap:0.6rem;">
+            <button class="btn btn-secondary" data-act="goto-course-logs" data-id="${c.id}" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;" title="前往本科目分組異動日誌">
+              <span>📋</span> <span>檢視分組異動日誌${courseLogsCache && courseLogsCache[c.id] ? ` (${courseLogsCache[c.id].length})` : ''}</span>
+            </button>
+            <button class="btn btn-secondary" data-act="export-json" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
+              <span>📥</span> <span>匯出分組完整結構 JSON</span>
+            </button>
+            <button class="btn btn-secondary" data-act="export-csv" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;" title="匯出全體學生期末評分結果，依學號由小到大排序">
+              <span>📊</span> <span>匯出評分成績 CSV（依學號排序）</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
     </div>
 
     <!-- 勾選要刪除的分組組別 -->
@@ -2690,16 +2771,22 @@ app.addEventListener('click', e => {
   if (a === 'make-groups') {
     if (!c) return;
     if (!c.students.length) return alert('請先匯入學生名單 Import roster first');
-    if (!confirm('將重建組別並清空現有分組，確定？\n\n系統將自動備份當前狀態，稍後如有需要可點擊「回到上一步」復原。')) return;
+    const n = Math.max(1, Math.ceil(c.students.length / Math.max(1, c.groupSize)));
+    if (!confirm(`確定依全班人數（${c.students.length}人）與每組人數（${c.groupSize}人）重建 ${n} 個預設空白組別？\n\n⚠️ 注意：這將清空現有的所有組別與學生分組分配，重設為 ${n} 個空白組別。\n系統將自動備份當前狀態，稍後如有需要可點擊「回到上一步」復原。`)) return;
     return act('teacher:make-groups', { courseId: c.id });
   }
-  if (a === 'make-remaining-groups') {
+  if (a === 'smart-auto-assign') {
     if (!c) return;
     const unassigned = c.students.filter(s => !s.groupId);
-    if (!unassigned.length) return alert('目前所有學生皆已分組，無未分組學生 No unassigned students');
-    const needCount = Math.max(1, Math.ceil(unassigned.length / Math.max(1, c.groupSize)));
-    if (!confirm(`目前有 ${unassigned.length} 位未分組學生，預計依每組 ${c.groupSize} 人建立 ${needCount} 個新組別。\n\n已建立之現有組別與成員將完全保留，確定建立？`)) return;
-    return act('teacher:make-remaining-groups', { courseId: c.id });
+    if (!unassigned.length) return alert('目前所有學生皆已完成分組，無未分組學生！No unassigned students');
+    if (!confirm(`確定執行一鍵智慧分配？\n\n1. 系統將優先填補未達最低門檻（< ${minCap(c)}人）的組別\n2. 剩餘未分組學生將依每組 ${c.groupSize} 人自動建立新組別並平均隨機分入\n\n系統已自動備份，稍後如有需要可點擊「回到上一步」復原。`)) return;
+    return act('teacher:smart-auto-assign', { courseId: c.id }, {
+      after: (data) => {
+        if (data && data.success) {
+          alert(`一鍵分配完成！✅\n• 優先填補組員：${data.filledCount} 人\n• 新建組別：${data.addedGroups} 組\n• 分配剩餘組員：${data.remainingCount} 人`);
+        }
+      }
+    });
   }
   if (a === 'restore-snapshot') {
     if (!c) return;
@@ -2711,7 +2798,7 @@ app.addEventListener('click', e => {
   if (a === 'clear-groups') {
     if (!c) return;
     if (!c.groups.length) return alert('本科目尚無分組 No groups to clear');
-    if (!confirm(`確定刪除「${courseLabel(c)}」的所有分組？\n\n注意：學生名單與課程設定皆會完整保留，僅清空組別與組別分配。\n系統將自動備份，稍後如有需要可點擊「回到上一步」復原。`)) return;
+    if (!confirm(`確定清空「${courseLabel(c)}」的所有組別並歸零重設？\n\n⚠️ 注意：所有組別將被刪除（組數變為 0 組），所有學生變回未分組。\n修課學生名單與課程設定皆會完整保留。系統將自動備份，稍後如有需要可點擊「回到上一步」復原。`)) return;
     return act('teacher:clear-groups', { courseId: c.id });
   }
   if (a === 'select-all-del-groups') {
@@ -2728,17 +2815,6 @@ app.addEventListener('click', e => {
     if (!checked.length) return alert('請先勾選欲刪除的組別 Please select at least one group');
     if (!confirm(`確定要刪除勾選的 ${checked.length} 個組別？\n\n被刪組別的組員將退回未分組名單，其餘組別與修課名單不受影響。`)) return;
     return act('teacher:del-groups', { courseId: c.id, groupIds: checked });
-  }
-  if (a === 'auto-assign') {
-    if (!c) return;
-    const unassignedList = c.students.filter(s => !s.groupId);
-    if (!unassignedList.length) return alert('目前所有學生皆已分組，無未分組學生 No unassigned students');
-    const min = minCap(c);
-    const completedCount = c.groups.filter(g => members(c, g.id).length >= min).length;
-    const incompleteCount = c.groups.length - completedCount;
-    if (!confirm(`確定要隨機分配剩餘的 ${unassignedList.length} 位未分組學生？\n\n📌 規則說明：\n• 系統將嚴格避開已達門檻（${min}人）的 ${completedCount} 個已完成組別，絕不更動其成員與名單。\n• 僅分配至未達門檻的 ${incompleteCount} 個組別；若現有組別皆已完成，系統將自動為剩餘組員建立新組別收納。`)) return;
-    return act('teacher:auto-assign', { courseId: c.id },
-      { after: () => alert('已成功完成剩餘學生隨機分配！已完成編組的組別成員完全保持不變。') });
   }
   if (a === 'toggle-group-edit') {
     if (!c) return;

@@ -1,4 +1,4 @@
-export const API_VERSION = 'v2.5.0 (2026.09.22-1324)';
+export const API_VERSION = 'v2.6.0 (2026.09.22-1411)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
@@ -6,6 +6,7 @@ import {
   fetchCourseLogs,
   todayDateStr, isDailySession, attendanceUnlockFor, isAttendanceEditable,
   invalidateStateCache as invalidateLibCache,
+  smartAutoAssign, saveSnapshot,
 } from './lib.js';
 
 // 短暫記憶體快取防護（針對公開未登入/學生輪詢，有效緩解 D1 讀取消耗）
@@ -66,19 +67,6 @@ export async function handleAction(request, env, db, body) {
     return json({ ok: true, courses: await publicize(db, env, await loadState(db), view), version: API_VERSION, ...extra }, 200, headers);
   };
 
-  const saveSnapshot = async (db, courseId) => {
-    const [snapGroups, snapStudents] = await Promise.all([
-      db.prepare('SELECT id, course_id, name, seq, allow_edit, edit_deadline, peer_eval_open, peer_eval_deadline, peer_eval_submitted FROM groups WHERE course_id = ?').bind(courseId).all(),
-      db.prepare('SELECT id, group_id, is_leader, is_vice, auto_assigned, peer_penalty, peer_comment FROM students WHERE course_id = ?').bind(courseId).all(),
-    ]);
-    const payload = JSON.stringify({
-      groups: snapGroups.results || [],
-      students: snapStudents.results || [],
-    });
-    await db.prepare('INSERT OR REPLACE INTO group_snapshots (course_id, snapshot, created_at) VALUES (?, ?, ?)')
-      .bind(courseId, payload, Date.now()).run();
-  };
-
   /* ---- 登入／登出 ---- */
   if (action === 'login-teacher') {
     if (await sha256(String(body.password || '')) !== await teacherHash(db)) return bad('密碼錯誤 Wrong password', 401);
@@ -130,10 +118,10 @@ export async function handleAction(request, env, db, body) {
         body.deadline || '',
       ];
       if (exists) {
-        await db.prepare('UPDATE courses SET year=?, subject=?, group_size=?, tolerance=?, deadline=? WHERE id=?').bind(...args, id).run();
+        await db.prepare('UPDATE courses SET year=?, subject=?, group_size=?, tolerance=?, deadline=?, deadline_triggered=0 WHERE id=?').bind(...args, id).run();
       } else {
-        await db.prepare('INSERT INTO courses (id, year, subject, group_size, tolerance, deadline, created_at) VALUES (?,?,?,?,?,?)')
-          .bind(id, ...args, Date.now()).run();
+        await db.prepare('INSERT INTO courses (id, year, subject, group_size, tolerance, deadline, deadline_triggered, created_at) VALUES (?,?,?,?,?,?,?,?)')
+          .bind(id, ...args, 0, Date.now()).run();
         // 新課程預先建立一則預設公告，說明評分規則
         const nowStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' ');
         const noticeId = 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -257,30 +245,9 @@ export async function handleAction(request, env, db, body) {
           .bind('g' + i, c.id, '第 ' + i + ' 組', i));
       }
       await db.batch(stmts);
-      await addLog(db, c.id, '老師', 'teacher-make-groups', `重新建立 ${n} 個空組別（清空原有分組分配）`);
-      return ok();
-    }
-    if (op === 'make-remaining-groups') {
-      const c = course(body.courseId);
-      if (!c) return bad('課程不存在', 404);
-      const unassigned = c.students.filter(s => !s.groupId);
-      if (!unassigned.length) return bad('目前所有學生皆已分組，無未分組學生', 400);
-
-      await saveSnapshot(db, c.id);
-      const needCount = Math.max(1, Math.ceil(unassigned.length / Math.max(1, c.groupSize)));
-      const curCount = c.groups.length;
-      let seq = await nextSeq(db, 'groups', c.id);
-
-      const stmts = [];
-      for (let i = 1; i <= needCount; i++) {
-        const gid = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-        const gname = '第 ' + (curCount + i) + ' 組';
-        stmts.push(db.prepare('INSERT INTO groups (id, course_id, name, seq) VALUES (?,?,?,?)')
-          .bind(gid, c.id, gname, seq++));
-      }
-      await db.batch(stmts);
-      await addLog(db, c.id, '老師', 'teacher-make-remaining', `針對未分組學生新建 ${needCount} 個組別`);
-      return ok({ addedGroups: needCount });
+      invalidateStateCache();
+      await addLog(db, c.id, '老師', 'teacher-make-groups', `依人數重建 ${n} 個預設空組別（已建立快照備份，清空原有分組分配）`);
+      return ok({ createdGroups: n });
     }
     if (op === 'restore-groups-snapshot') {
       const c = course(body.courseId);
@@ -371,74 +338,12 @@ export async function handleAction(request, env, db, body) {
         .bind(open, deadline, c.id).run();
       return ok();
     }
-    if (op === 'auto-assign') {
+    if (op === 'smart-auto-assign' || op === 'auto-assign') {
       const c = course(body.courseId);
       if (!c) return bad('課程不存在', 404);
-      const unassignedStudents = c.students.filter(x => !x.groupId);
-      if (!unassignedStudents.length) return bad('目前沒有未分組學生 No unassigned students', 400);
-
-      const min = minCap(c);
-      const max = cap(c);
-
-      // 篩選出「尚未完成分組」的組別（成員數小於最低門檻 minCap）
-      // 已達到或超過最低門檻的組別視為「已完成編組的組別」，嚴格避開，不可新增或刪減其成員
-      let candidateGroups = c.groups.filter(g => membersOf(c, g.id).length < min);
-
-      // 若目前沒有任何未滿門檻的組別，但仍有剩餘未分組學生，
-      // 則依每組規定人數建立新的組別供剩餘學生分配，絕不更動已完成分組的組別
-      if (!candidateGroups.length) {
-        const groupSize = Math.max(1, Number(c.groupSize) || 4);
-        const needNewGroups = Math.max(1, Math.ceil(unassignedStudents.length / groupSize));
-        let seq = await nextSeq(db, 'groups', c.id);
-        const newGroupStmts = [];
-        const createdGroups = [];
-        for (let i = 0; i < needNewGroups; i++) {
-          const newGid = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) + i;
-          const newName = '第 ' + (c.groups.length + i + 1) + ' 組';
-          newGroupStmts.push(db.prepare('INSERT INTO groups (id, course_id, name, seq) VALUES (?,?,?,?)')
-            .bind(newGid, c.id, newName, seq++));
-          createdGroups.push({ id: newGid, name: newName });
-        }
-        await db.batch(newGroupStmts);
-        candidateGroups = createdGroups;
-      }
-
-      const stmts = [];
-      const shuffled = shuffle(unassignedStudents);
-      const groupCounts = {};
-      candidateGroups.forEach(g => {
-        groupCounts[g.id] = membersOf(c, g.id).length;
-      });
-
-      for (const s of shuffled) {
-        // 依照候選組別目前人數由少到多排序
-        const target = candidateGroups.slice().sort((a, b) => groupCounts[a.id] - groupCounts[b.id])[0];
-        if (!target || groupCounts[target.id] >= max) {
-          // 若所有候選組別皆已達人數上限，動態開新組收納剩餘組員
-          const newGid = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
-          const newName = '第 ' + (c.groups.length + candidateGroups.length + 1) + ' 組';
-          const seq = await nextSeq(db, 'groups', c.id);
-          stmts.push(db.prepare('INSERT INTO groups (id, course_id, name, seq) VALUES (?,?,?,?)')
-            .bind(newGid, c.id, newName, seq));
-          const newG = { id: newGid, name: newName };
-          candidateGroups.push(newG);
-          groupCounts[newGid] = 1;
-          s.groupId = newGid;
-          s.autoAssigned = true;
-          stmts.push(db.prepare('UPDATE students SET group_id=?, auto_assigned=1 WHERE course_id=? AND id=?').bind(newGid, c.id, s.id));
-          continue;
-        }
-
-        groupCounts[target.id]++;
-        s.groupId = target.id;
-        s.autoAssigned = true;
-        stmts.push(db.prepare('UPDATE students SET group_id=?, auto_assigned=1 WHERE course_id=? AND id=?').bind(target.id, c.id, s.id));
-      }
-
-      if (stmts.length) await db.batch(stmts);
-      invalidateStateCache();
-      await addLog(db, c.id, '老師', 'teacher-auto-assign', `隨機分配剩餘 ${unassignedStudents.length} 位未分組學生`);
-      return ok();
+      const res = await smartAutoAssign(db, c, '老師');
+      if (!res.success) return bad(res.message, 400);
+      return ok(res);
     }
 
     /* ---- 點名管理（老師） ---- */

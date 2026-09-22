@@ -121,6 +121,9 @@ async function ensureGroupSchema(db) {
     await db.prepare('ALTER TABLE students ADD COLUMN password_hash TEXT NOT NULL DEFAULT \'\'').run();
   } catch (_) {}
   try {
+    await db.prepare('ALTER TABLE courses ADD COLUMN deadline_triggered INTEGER NOT NULL DEFAULT 0').run();
+  } catch (_) {}
+  try {
     await db.prepare(`CREATE TABLE IF NOT EXISTS attendance_sessions (
       id          TEXT NOT NULL,
       course_id   TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
@@ -411,6 +414,7 @@ export async function loadState(db) {
     const courseObj = {
       id: c.id, year: c.year, subject: c.subject,
       groupSize: c.group_size, tolerance: c.tolerance, deadline: c.deadline,
+      deadlineTriggered: !!c.deadline_triggered,
       notices: courseNotices,
       logs: [], // 依需動態載入，避免每次常態輪詢浪費 D1 額度
       hasSnapshot: snapshotSet.has(c.id),
@@ -445,49 +449,6 @@ export function shuffle(a) {
   return a;
 }
 
-/* 逾時：
-   1. 學生組長建立之組別若人數未達最低門檻 minCap，則視為未完成建立並予以解散，成員釋出為未分組；
-   2. 剩餘未被挑選者隨機分配至組別並標示自動。 */
-export async function applyDeadline(db, courses) {
-  const stmts = [];
-  for (const c of courses) {
-    if (!deadlinePassed(c) || !c.groups.length) continue;
-
-    // 步驟 1：檢查並解散未達最低門檻之組別
-    const min = minCap(c);
-    const validGroups = [];
-    for (const g of c.groups) {
-      const gMembers = membersOf(c, g.id);
-      if (gMembers.length < min) {
-        // 未達門檻：清空該組成員並刪除該組別
-        for (const m of gMembers) {
-          m.groupId = null;
-          m.isLeader = false;
-          m.isVice = false;
-        }
-        stmts.push(db.prepare('UPDATE students SET group_id = NULL, is_leader = 0, is_vice = 0 WHERE course_id = ? AND group_id = ?').bind(c.id, g.id));
-        stmts.push(db.prepare('DELETE FROM groups WHERE course_id = ? AND id = ?').bind(c.id, g.id));
-      } else {
-        validGroups.push(g);
-      }
-    }
-    c.groups = validGroups;
-
-    // 步驟 2：將未分組學生隨機分配至現有組別（系統隨機分組不限最低門檻）
-    if (!validGroups.length) continue;
-    for (const s of shuffle(c.students.filter(x => !x.groupId))) {
-      const target = validGroups.slice().sort((a, b) => membersOf(c, a.id).length - membersOf(c, b.id).length)[0];
-      if (!target || membersOf(c, target.id).length >= cap(c)) continue;
-      s.groupId = target.id;
-      s.autoAssigned = true;
-      stmts.push(db.prepare('UPDATE students SET group_id = ?, auto_assigned = 1 WHERE course_id = ? AND id = ?')
-        .bind(target.id, c.id, s.id));
-    }
-  }
-  if (stmts.length) await db.batch(stmts);
-  return courses;
-}
-
 export async function teacherHash(db) {
   const row = await db.prepare('SELECT value FROM settings WHERE key = ?').bind('teacher_password').first();
   if (row) return row.value;
@@ -500,6 +461,143 @@ export const nextSeq = async (db, table, courseId) => {
   const r = await db.prepare(`SELECT COALESCE(MAX(seq), 0) AS m FROM ${table} WHERE course_id = ?`).bind(courseId).first();
   return ((r && r.m) || 0) + 1;
 };
+
+export async function saveSnapshot(db, courseId) {
+  const [snapGroups, snapStudents] = await Promise.all([
+    db.prepare('SELECT id, course_id, name, seq, allow_edit, edit_deadline, peer_eval_open, peer_eval_deadline, peer_eval_submitted FROM groups WHERE course_id = ?').bind(courseId).all(),
+    db.prepare('SELECT id, group_id, is_leader, is_vice, auto_assigned, peer_penalty, peer_comment FROM students WHERE course_id = ?').bind(courseId).all(),
+  ]);
+  const payload = JSON.stringify({
+    groups: snapGroups.results || [],
+    students: snapStudents.results || [],
+  });
+  await db.prepare('INSERT OR REPLACE INTO group_snapshots (course_id, snapshot, created_at) VALUES (?, ?, ?)')
+    .bind(courseId, payload, Date.now()).run();
+}
+
+/**
+ * 智慧自動補齊門檻並分配剩餘學生演算法：
+ * 1. 取得未分組學生名單並隨機打散
+ * 2. 第一階段：優先填補未達最低門檻 minCap 的現有組別，直到各未達門檻組別均達到 minCap（或未分組學生用罄）
+ * 3. 第二階段：計算剩餘未分組學生人數，依每組人數 groupSize 計算需新建之組別數
+ *    動態建立新組別，並將剩餘未分組學生輪流均衡分配加入新組別
+ * 4. 批次寫入資料庫並記錄異動日誌
+ */
+export async function smartAutoAssign(db, c, operatorName = '老師') {
+  const unassignedStudents = c.students.filter(x => !x.groupId);
+  if (!unassignedStudents.length) {
+    return { success: false, message: '目前沒有未分組學生 No unassigned students', filledCount: 0, addedGroups: 0, remainingCount: 0 };
+  }
+
+  // 自動備份快照，以便老師需要時可回到上一步復原
+  await saveSnapshot(db, c.id);
+
+  const min = minCap(c);
+  const targetGroupSize = Math.max(1, Number(c.groupSize) || 4);
+
+  // 1. 找出所有未達最低門檻的現有組別
+  const candidateGroups = c.groups.filter(g => membersOf(c, g.id).length < min);
+  const shuffled = shuffle([...unassignedStudents]);
+
+  const groupCounts = {};
+  c.groups.forEach(g => {
+    groupCounts[g.id] = membersOf(c, g.id).length;
+  });
+
+  const stmts = [];
+  let filledCount = 0;
+
+  // 2. 第一階段：依人數由少至多，優先填補未達門檻組別
+  while (shuffled.length > 0) {
+    const underMin = candidateGroups.filter(g => groupCounts[g.id] < min)
+      .sort((a, b) => groupCounts[a.id] - groupCounts[b.id]);
+    if (!underMin.length) break;
+
+    const target = underMin[0];
+    const s = shuffled.shift();
+    s.groupId = target.id;
+    s.autoAssigned = true;
+    groupCounts[target.id]++;
+    filledCount++;
+
+    stmts.push(
+      db.prepare('UPDATE students SET group_id = ?, auto_assigned = 1 WHERE course_id = ? AND id = ?')
+        .bind(target.id, c.id, s.id)
+    );
+  }
+
+  // 3. 第二階段：剩餘未分組學生自動建組並分配
+  const remainingCount = shuffled.length;
+  let addedGroups = 0;
+
+  if (remainingCount > 0) {
+    addedGroups = Math.max(1, Math.ceil(remainingCount / targetGroupSize));
+    let seq = await nextSeq(db, 'groups', c.id);
+    const curTotalGroups = c.groups.length;
+    const newGroups = [];
+
+    for (let i = 0; i < addedGroups; i++) {
+      const newGid = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) + i;
+      const newName = '第 ' + (curTotalGroups + i + 1) + ' 組';
+      stmts.push(
+        db.prepare('INSERT INTO groups (id, course_id, name, seq) VALUES (?,?,?,?)')
+          .bind(newGid, c.id, newName, seq++)
+      );
+      const newG = { id: newGid, name: newName };
+      newGroups.push(newG);
+      c.groups.push(newG);
+      groupCounts[newGid] = 0;
+    }
+
+    // 輪流分配（Round-Robin）將剩餘組員平均分入新組別中
+    shuffled.forEach((s, idx) => {
+      const targetGroup = newGroups[idx % newGroups.length];
+      s.groupId = targetGroup.id;
+      s.autoAssigned = true;
+      groupCounts[targetGroup.id]++;
+
+      stmts.push(
+        db.prepare('UPDATE students SET group_id = ?, auto_assigned = 1 WHERE course_id = ? AND id = ?')
+          .bind(targetGroup.id, c.id, s.id)
+      );
+    });
+  }
+
+  if (stmts.length) {
+    await db.batch(stmts);
+  }
+
+  invalidateStateCache();
+
+  const logDesc = `一鍵自動分配未分組學生：優先填補 ${filledCount} 人至未達門檻組別` +
+    (addedGroups > 0 ? `，並新建 ${addedGroups} 個組別分配剩餘 ${remainingCount} 人` : '（所有未分組成員已全數填入現有組別）');
+  await addLog(db, c.id, operatorName, 'teacher-smart-auto-assign', logDesc);
+
+  return {
+    success: true,
+    filledCount,
+    addedGroups,
+    remainingCount,
+  };
+}
+
+/* 截止時間到期自動觸發：
+   當老師設定之分組截止時間到達時，系統自動觸發一次智慧分配，
+   優先補齊未達門檻之組別，並為剩餘組員自動建立組別與分配入組。 */
+export async function applyDeadline(db, courses) {
+  for (const c of courses) {
+    if (!deadlinePassed(c) || c.deadlineTriggered) continue;
+
+    // 截止時間到達且尚未觸發過：自動執行一次智慧分配
+    await smartAutoAssign(db, c, '系統 (分組截止時間到達)');
+
+    // 標記該課程截止時間已觸發
+    await db.prepare('UPDATE courses SET deadline_triggered = 1 WHERE id = ?').bind(c.id).run();
+    c.deadlineTriggered = true;
+    invalidateStateCache();
+  }
+  return courses;
+}
 
 /* ===== 對外遮蔽學號 =====
    學號同時是學生的登入密碼，因此非老師的回應一律遮蔽；

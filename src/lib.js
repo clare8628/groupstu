@@ -550,6 +550,7 @@ export async function loadState(db) {
     db.prepare('SELECT * FROM attendance_sessions ORDER BY date DESC, created_at DESC').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM attendance_records').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM attendance_unlocks').all().catch(() => ({ results: [] })),
+    db.prepare('SELECT * FROM attendance_delegates').all().catch(() => ({ results: [] })),
   ]);
 
   // 自動檢測重複組別：若資料庫內存在同名重複組別，即時自動自癒修復
@@ -573,6 +574,11 @@ export async function loadState(db) {
   const courseList = (courses && courses.results) || [];
   const allGroups = (groups && groups.results) || [];
   const allStudents = (students && students.results) || [];
+  const allNotices = (notices && notices.results) || [];
+  const allSessions = (attSessions && attSessions.results) || [];
+  const allRecords = (attRecords && attRecords.results) || [];
+  const allUnlocks = (attUnlocks && attUnlocks.results) || [];
+  const allDelegates = (attDelegates && attDelegates.results) || [];
 
   const result = courseList.map(c => {
     const courseGroups = allGroups.filter(g => g.course_id === c.id).map(g => ({
@@ -601,11 +607,11 @@ export async function loadState(db) {
       hasCustomPassword: !!s.password_hash,
     }));
 
-    const courseNotices = (notices.results || [])
+    const courseNotices = allNotices
       .filter(n => n.course_id === c.id)
       .map(n => ({ id: n.id, content: n.content, time: n.time_str || '' }));
 
-    const courseSessions = (attSessions.results || [])
+    const courseSessions = allSessions
       .filter(s => s.course_id === c.id)
       .map(s => ({
         id: s.id,
@@ -616,7 +622,7 @@ export async function loadState(db) {
         createdAt: s.created_at || 0,
       }));
 
-    const courseRecords = (attRecords.results || [])
+    const courseRecords = allRecords
       .filter(r => r.course_id === c.id)
       .map(r => ({
         sessionId: r.session_id,
@@ -629,7 +635,7 @@ export async function loadState(db) {
         updatedAt: r.updated_at || r.created_at || 0,
       }));
 
-    const courseUnlocks = (attUnlocks.results || [])
+    const courseUnlocks = allUnlocks
       .filter(u => u.course_id === c.id)
       .map(u => ({
         sessionId: u.session_id,
@@ -638,7 +644,7 @@ export async function loadState(db) {
         createdAt: u.created_at || 0,
       }));
 
-    const courseDelegates = (attDelegates.results || [])
+    const courseDelegates = allDelegates
       .filter(d => d.course_id === c.id)
       .map(d => ({
         sessionId: d.session_id,

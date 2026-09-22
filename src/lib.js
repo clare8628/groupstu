@@ -175,7 +175,119 @@ async function ensureGroupSchema(db) {
       PRIMARY KEY (course_id, session_id, group_id, delegate_id)
     )`).run();
   } catch (_) {}
+  try {
+    await cleanupDuplicateAndEmptyGroups(db);
+  } catch (_) {}
   _ensuredGroupSchema = true;
+}
+
+/* ===== 組別編號解析與連續性控制演算法 ===== */
+export function parseGroupNumber(name) {
+  if (!name) return null;
+  const m = String(name).match(/(?:第\s*(\d+)\s*組|Group\s*(\d+)|^(\d+)$)/i);
+  if (m) {
+    return parseInt(m[1] || m[2] || m[3], 10);
+  }
+  return null;
+}
+
+/**
+ * 取得填補空缺後的可用組別編號清單：
+ * 檢查現有組別編號（如 [1, 2, 4, 5, 8]），從 1 開始由小至大尋找未被佔用的缺號（填補為 [3, 6, 7]），
+ * 嚴格遵循「不更動既有學生組別編號」的最高原則，使組別編號平滑連續無空缺。
+ */
+export function getNextAvailableGroupNumbers(existingGroups, count = 1) {
+  const occupied = new Set();
+  (existingGroups || []).forEach(g => {
+    const num = parseGroupNumber(g && g.name);
+    if (num !== null && num > 0) occupied.add(num);
+  });
+  const result = [];
+  let candidate = 1;
+  while (result.length < count) {
+    if (!occupied.has(candidate)) {
+      result.push(candidate);
+      occupied.add(candidate);
+    }
+    candidate++;
+  }
+  return result;
+}
+
+/**
+ * 清理重複組名與無成員之空組別：
+ * 1. 找出同一課程中重複同名的組別，優先保留有組員者，刪除沒有組員的副本
+ * 2. 移除所有完全沒有組員的空組別（因組長後悔退回或先前產生的空組）
+ * 3. 最高原則保證：凡是由學生自行組建且有組員之組別，絕不更動、絕不刪除！
+ */
+export async function cleanupDuplicateAndEmptyGroups(db, specificCourseId = null) {
+  const coursesQuery = specificCourseId 
+    ? db.prepare('SELECT id FROM courses WHERE id = ?').bind(specificCourseId)
+    : db.prepare('SELECT id FROM courses');
+  const { results: courses } = await coursesQuery.all();
+  if (!courses || !courses.length) return { totalRemoved: 0, removedDetails: [] };
+
+  let totalRemoved = 0;
+  const removedDetails = [];
+
+  for (const c of courses) {
+    const [groupsRes, studentsRes] = await Promise.all([
+      db.prepare('SELECT id, name, seq FROM groups WHERE course_id = ? ORDER BY seq ASC').bind(c.id).all(),
+      db.prepare('SELECT id, group_id FROM students WHERE course_id = ?').bind(c.id).all(),
+    ]);
+    const groups = groupsRes.results || [];
+    const students = studentsRes.results || [];
+
+    const memberCounts = {};
+    groups.forEach(g => { memberCounts[g.id] = 0; });
+    students.forEach(s => {
+      if (s.group_id && memberCounts[s.group_id] !== undefined) {
+        memberCounts[s.group_id]++;
+      }
+    });
+
+    const toDeleteIds = new Set();
+    const nameMap = new Map();
+
+    for (const g of groups) {
+      if (!nameMap.has(g.name)) nameMap.set(g.name, []);
+      nameMap.get(g.name).push(g);
+    }
+
+    for (const [name, gList] of nameMap.entries()) {
+      if (gList.length > 1) {
+        // 同名重複組別：只刪除沒有成員的副本；凡是有成員的組別一律保留
+        const withoutMembers = gList.filter(g => memberCounts[g.id] === 0);
+        withoutMembers.forEach(g => toDeleteIds.add(g.id));
+      } else {
+        // 單一組別：若完全沒有成員，視為遺缺或無人空組別予以清理
+        const g = gList[0];
+        if (memberCounts[g.id] === 0) {
+          toDeleteIds.add(g.id);
+        }
+      }
+    }
+
+    const idsArray = Array.from(toDeleteIds);
+    if (idsArray.length > 0) {
+      const delStmts = [];
+      for (const gid of idsArray) {
+        delStmts.push(db.prepare('DELETE FROM groups WHERE course_id = ? AND id = ?').bind(c.id, gid));
+        delStmts.push(db.prepare('DELETE FROM attendance_unlocks WHERE course_id = ? AND group_id = ?').bind(c.id, gid));
+        delStmts.push(db.prepare('DELETE FROM attendance_delegates WHERE course_id = ? AND group_id = ?').bind(c.id, gid));
+      }
+      for (let i = 0; i < delStmts.length; i += 50) {
+        await db.batch(delStmts.slice(i, i + 50));
+      }
+      totalRemoved += idsArray.length;
+      removedDetails.push({ courseId: c.id, count: idsArray.length });
+    }
+  }
+
+  if (totalRemoved > 0) {
+    invalidateStateCache();
+  }
+  return { totalRemoved, removedDetails };
 }
 
 /* ===== 伺服器短暫記憶體快取與快取失效 ===== */
@@ -355,6 +467,14 @@ export async function loadState(db) {
       peerEvalDeadline: g.peer_eval_deadline || '',
       peerEvalSubmitted: !!g.peer_eval_submitted,
     }));
+    courseGroups.sort((a, b) => {
+      const na = parseGroupNumber(a.name);
+      const nb = parseGroupNumber(b.name);
+      if (na !== null && nb !== null) return na - nb;
+      if (na !== null) return -1;
+      if (nb !== null) return 1;
+      return (a.seq || 0) - (b.seq || 0);
+    });
     const courseStudents = students.results.filter(s => s.course_id === c.id).map(s => ({
       id: s.id, name: s.name, groupId: s.group_id,
       isLeader: !!s.is_leader, isVice: !!s.is_vice, autoAssigned: !!s.auto_assigned,
@@ -484,6 +604,10 @@ export async function saveSnapshot(db, courseId) {
  * 4. 批次寫入資料庫並記錄異動日誌
  */
 export async function smartAutoAssign(db, c, operatorName = '老師') {
+  // 先清理可能存在的重複組名或無成員之空組別，保留所有有成員之組別
+  await cleanupDuplicateAndEmptyGroups(db, c.id);
+  c.groups = c.groups.filter(g => membersOf(c, g.id).length > 0);
+
   const unassignedStudents = c.students.filter(x => !x.groupId);
   if (!unassignedStudents.length) {
     return { success: false, message: '目前沒有未分組學生 No unassigned students', filledCount: 0, addedGroups: 0, remainingCount: 0 };
@@ -495,7 +619,7 @@ export async function smartAutoAssign(db, c, operatorName = '老師') {
   const min = minCap(c);
   const targetGroupSize = Math.max(1, Number(c.groupSize) || 4);
 
-  // 1. 找出所有未達最低門檻的現有組別
+  // 1. 找出所有未達最低門檻的現有組別（皆為有組員之組別）
   const candidateGroups = c.groups.filter(g => membersOf(c, g.id).length < min);
   const shuffled = shuffle([...unassignedStudents]);
 
@@ -526,19 +650,20 @@ export async function smartAutoAssign(db, c, operatorName = '老師') {
     );
   }
 
-  // 3. 第二階段：剩餘未分組學生自動建組並分配
+  // 3. 第二階段：剩餘未分組學生自動建組並分配（優先填補空缺組號，絕不更動學生自組之組別）
   const remainingCount = shuffled.length;
   let addedGroups = 0;
 
   if (remainingCount > 0) {
     addedGroups = Math.max(1, Math.ceil(remainingCount / targetGroupSize));
     let seq = await nextSeq(db, 'groups', c.id);
-    const curTotalGroups = c.groups.length;
+    const availableNumbers = getNextAvailableGroupNumbers(c.groups, addedGroups);
     const newGroups = [];
 
     for (let i = 0; i < addedGroups; i++) {
       const newGid = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) + i;
-      const newName = '第 ' + (curTotalGroups + i + 1) + ' 組';
+      const num = availableNumbers[i];
+      const newName = '第 ' + num + ' 組';
       stmts.push(
         db.prepare('INSERT INTO groups (id, course_id, name, seq) VALUES (?,?,?,?)')
           .bind(newGid, c.id, newName, seq++)
@@ -564,13 +689,15 @@ export async function smartAutoAssign(db, c, operatorName = '老師') {
   }
 
   if (stmts.length) {
-    await db.batch(stmts);
+    for (let i = 0; i < stmts.length; i += 50) {
+      await db.batch(stmts.slice(i, i + 50));
+    }
   }
 
   invalidateStateCache();
 
   const logDesc = `一鍵自動分配未分組學生：優先填補 ${filledCount} 人至未達門檻組別` +
-    (addedGroups > 0 ? `，並新建 ${addedGroups} 個組別分配剩餘 ${remainingCount} 人` : '（所有未分組成員已全數填入現有組別）');
+    (addedGroups > 0 ? `，並新建 ${addedGroups} 個組別（填補空缺組號）分配剩餘 ${remainingCount} 人` : '（所有未分組成員已全數填入現有組別）');
   await addLog(db, c.id, operatorName, 'teacher-smart-auto-assign', logDesc);
 
   return {

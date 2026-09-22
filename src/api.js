@@ -1,4 +1,4 @@
-export const API_VERSION = 'v2.6.0 (2026.09.22-1411)';
+export const API_VERSION = 'v2.6.1 (2026.09.22-1442)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
@@ -7,6 +7,7 @@ import {
   todayDateStr, isDailySession, attendanceUnlockFor, isAttendanceEditable,
   invalidateStateCache as invalidateLibCache,
   smartAutoAssign, saveSnapshot,
+  parseGroupNumber, getNextAvailableGroupNumbers, cleanupDuplicateAndEmptyGroups,
 } from './lib.js';
 
 // 短暫記憶體快取防護（針對公開未登入/學生輪詢，有效緩解 D1 讀取消耗）
@@ -289,10 +290,21 @@ export async function handleAction(request, env, db, body) {
     if (op === 'add-group') {
       const c = course(body.courseId);
       if (!c) return bad('課程不存在', 404);
+      const nextNum = getNextAvailableGroupNumbers(c.groups, 1)[0];
       const seq = await nextSeq(db, 'groups', c.id);
+      const newName = '第 ' + nextNum + ' 組';
       await db.prepare('INSERT INTO groups (id, course_id, name, seq) VALUES (?,?,?,?)')
-        .bind('g' + Date.now().toString(36), c.id, '第 ' + (c.groups.length + 1) + ' 組', seq).run();
-      return ok();
+        .bind('g' + Date.now().toString(36), c.id, newName, seq).run();
+      invalidateStateCache();
+      await addLog(db, c.id, '老師', 'teacher-add-group', `手動新增組別：${newName}`);
+      return ok({ name: newName });
+    }
+    if (op === 'cleanup-groups') {
+      const c = course(body.courseId);
+      if (!c) return bad('課程不存在', 404);
+      const res = await cleanupDuplicateAndEmptyGroups(db, c.id);
+      await addLog(db, c.id, '老師', 'teacher-cleanup-groups', `清理重複與無人組別：共移除 ${res.totalRemoved} 個無成員之重複或空白組別（保留所有學生自組組別）`);
+      return ok({ removed: res.totalRemoved });
     }
     if (op === 'clear-groups') {
       const c = course(body.courseId);
@@ -490,8 +502,9 @@ export async function handleAction(request, env, db, body) {
         gid = empty.id;
         groupName = empty.name;
       } else {
+        const nextNum = getNextAvailableGroupNumbers(c.groups, 1)[0];
         gid = 'g' + Date.now().toString(36);
-        groupName = '第 ' + (c.groups.length + 1) + ' 組';
+        groupName = '第 ' + nextNum + ' 組';
         const seq = await nextSeq(db, 'groups', c.id);
         await db.prepare('INSERT INTO groups (id, course_id, name, seq) VALUES (?,?,?,?)')
           .bind(gid, c.id, groupName, seq).run();

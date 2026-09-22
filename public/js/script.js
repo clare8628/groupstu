@@ -1,6 +1,6 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.6.0 (2026.09.22-1411)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.6.1 (2026.09.22-1442)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
@@ -2031,6 +2031,9 @@ function teacherCourse(c) {
             <button class="btn btn-secondary" data-act="add-group" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
               <span>➕</span> <span>手動新增一組 Add Group（現有 ${c.groups.length} 組）</span>
             </button>
+            <button class="btn btn-secondary" data-act="cleanup-groups" title="自動移除重複組名或無成員組別，保留學生組建之組別" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
+              <span>🧹</span> <span>清理重複與無人組別 Clean Empty Groups</span>
+            </button>
             <button class="btn btn-secondary" data-act="make-groups" title="清空現有分組分配，並依人數重建 N 個空白組別" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
               <span>🔄</span> <span>依人數重建預設空組別（清空分配並建 ${Math.max(1, Math.ceil(total / Math.max(1, c.groupSize)))} 組）</span>
             </button>
@@ -2795,6 +2798,16 @@ app.addEventListener('click', e => {
       { after: () => alert('已成功回到上一步，分組狀態已復原！') });
   }
   if (a === 'add-group') { if (!c) return; return act('teacher:add-group', { courseId: c.id }); }
+  if (a === 'cleanup-groups') {
+    if (!c) return;
+    if (!confirm(`確定要清理「${courseLabel(c)}」中的重複組名與無成員空組別？\n\n🛡️ 最高原則保證：凡是有組員或學生自組之組別皆會完整保留，絕不更動！\n系統僅會移除完全沒有學生的空組別及冗餘重複組名。`)) return;
+    return act('teacher:cleanup-groups', { courseId: c.id }, {
+      after: res => {
+        const count = res && res.removed !== undefined ? res.removed : 0;
+        alert(`清理完成！已移除 ${count} 個重複或無成員空組別，學生自組之組別已全數保留。`);
+      }
+    });
+  }
   if (a === 'clear-groups') {
     if (!c) return;
     if (!c.groups.length) return alert('本科目尚無分組 No groups to clear');

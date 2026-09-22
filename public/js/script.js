@@ -1,6 +1,6 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.6.1 (2026.09.22-1442)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.6.2 (2026.09.22-1454)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
@@ -2034,6 +2034,9 @@ function teacherCourse(c) {
             <button class="btn btn-secondary" data-act="cleanup-groups" title="自動移除重複組名或無成員組別，保留學生組建之組別" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
               <span>🧹</span> <span>清理重複與無人組別 Clean Empty Groups</span>
             </button>
+            <button class="btn btn-secondary" data-act="renumber-groups" title="將現有組別重新整理為第 1 組至第 N 組連續組號（消除中間缺號）" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
+              <span>🔢</span> <span>重整組號連續 (1 ~ ${c.groups.length} 組) Renumber 1..N</span>
+            </button>
             <button class="btn btn-secondary" data-act="make-groups" title="清空現有分組分配，並依人數重建 N 個空白組別" style="text-align:left;display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.8rem;">
               <span>🔄</span> <span>依人數重建預設空組別（清空分配並建 ${Math.max(1, Math.ceil(total / Math.max(1, c.groupSize)))} 組）</span>
             </button>
@@ -2800,11 +2803,22 @@ app.addEventListener('click', e => {
   if (a === 'add-group') { if (!c) return; return act('teacher:add-group', { courseId: c.id }); }
   if (a === 'cleanup-groups') {
     if (!c) return;
-    if (!confirm(`確定要清理「${courseLabel(c)}」中的重複組名與無成員空組別？\n\n🛡️ 最高原則保證：凡是有組員或學生自組之組別皆會完整保留，絕不更動！\n系統僅會移除完全沒有學生的空組別及冗餘重複組名。`)) return;
+    if (!confirm(`確定要清理「${courseLabel(c)}」中的重複組名與無成員空組別？\n\n🛡️ 最高原則保證：凡是有組員或學生自組之組別皆會完整保留，絕不更動！\n系統僅會移除完全沒有學生的空組別，並自動修正重名組別以填補缺號。`)) return;
     return act('teacher:cleanup-groups', { courseId: c.id }, {
       after: res => {
-        const count = res && res.removed !== undefined ? res.removed : 0;
-        alert(`清理完成！已移除 ${count} 個重複或無成員空組別，學生自組之組別已全數保留。`);
+        const removed = res && res.removed !== undefined ? res.removed : 0;
+        const renamed = res && res.renamed !== undefined ? res.renamed : 0;
+        alert(`清理完成！\n• 移除空組別：${removed} 個\n• 修正重名填補缺號：${renamed} 組\n\n🛡️ 學生自組之組別已全數保留。`);
+      }
+    });
+  }
+  if (a === 'renumber-groups') {
+    if (!c) return;
+    if (!c.groups.length) return alert('本科目尚無組別');
+    if (!confirm(`確定要將「${courseLabel(c)}」現有的 ${c.groups.length} 個組別重新編號為平滑連續的第 1 組～第 ${c.groups.length} 組？\n\n📌 說明：各組成員與組長完全不變，僅將組別名稱整理為連續序號（消除中間缺號）。系統會自動建立備份快照，可點擊「回到上一步」復原。`)) return;
+    return act('teacher:renumber-groups', { courseId: c.id }, {
+      after: res => {
+        alert(`重整完成！已將現有 ${c.groups.length} 個組別整理為連續序號（共調整 ${res ? res.updated : 0} 組）。`);
       }
     });
   }

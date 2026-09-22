@@ -1,4 +1,4 @@
-export const API_VERSION = 'v2.6.1 (2026.09.22-1442)';
+export const API_VERSION = 'v2.6.2 (2026.09.22-1454)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
@@ -8,6 +8,7 @@ import {
   invalidateStateCache as invalidateLibCache,
   smartAutoAssign, saveSnapshot,
   parseGroupNumber, getNextAvailableGroupNumbers, cleanupDuplicateAndEmptyGroups,
+  renumberGroupsSequentially,
 } from './lib.js';
 
 // 短暫記憶體快取防護（針對公開未登入/學生輪詢，有效緩解 D1 讀取消耗）
@@ -303,8 +304,16 @@ export async function handleAction(request, env, db, body) {
       const c = course(body.courseId);
       if (!c) return bad('課程不存在', 404);
       const res = await cleanupDuplicateAndEmptyGroups(db, c.id);
-      await addLog(db, c.id, '老師', 'teacher-cleanup-groups', `清理重複與無人組別：共移除 ${res.totalRemoved} 個無成員之重複或空白組別（保留所有學生自組組別）`);
-      return ok({ removed: res.totalRemoved });
+      await addLog(db, c.id, '老師', 'teacher-cleanup-groups', `清理重複與無人組別：移除 ${res.totalRemoved} 個無成員組別，自動重命名修正 ${res.totalRenamed} 個重複衝突組別填補缺號（保留所有學生自組組別）`);
+      return ok({ removed: res.totalRemoved, renamed: res.totalRenamed });
+    }
+    if (op === 'renumber-groups') {
+      const c = course(body.courseId);
+      if (!c) return bad('課程不存在', 404);
+      await saveSnapshot(db, c.id);
+      const res = await renumberGroupsSequentially(db, c.id);
+      await addLog(db, c.id, '老師', 'teacher-renumber-groups', `重新整理組別序號為平滑連續（共更新 ${res.updated} 組組名，已自動建立快照）`);
+      return ok({ updated: res.updated });
     }
     if (op === 'clear-groups') {
       const c = course(body.courseId);

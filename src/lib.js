@@ -215,34 +215,43 @@ export function getNextAvailableGroupNumbers(existingGroups, count = 1) {
 }
 
 /**
- * 清理重複組名與無成員之空組別：
- * 1. 找出同一課程中重複同名的組別，優先保留有組員者，刪除沒有組員的副本
- * 2. 移除所有完全沒有組員的空組別（因組長後悔退回或先前產生的空組）
- * 3. 最高原則保證：凡是由學生自行組建且有組員之組別，絕不更動、絕不刪除！
+ * 清理重複組名與無成員之空組別，並自動修正重名組別填補空缺：
+ * 1. 移除所有完全沒有組員的空組別（0人空組）
+ * 2. 同一名稱重複時：
+ *    - 凡是有組長之組別（由學生自主建立），原有名稱 100% 完整保留（最高原則）
+ *    - 無成員之副本直接刪除
+ *    - 若同名重複組別皆有成員（先前自動建組產生重名），將無組長之重複組別自動重新命名為最低之缺號（如第 4 組、第 10 組）
+ * 3. 確保組別既不重複、又填補缺號。
  */
 export async function cleanupDuplicateAndEmptyGroups(db, specificCourseId = null) {
   const coursesQuery = specificCourseId 
     ? db.prepare('SELECT id FROM courses WHERE id = ?').bind(specificCourseId)
     : db.prepare('SELECT id FROM courses');
   const { results: courses } = await coursesQuery.all();
-  if (!courses || !courses.length) return { totalRemoved: 0, removedDetails: [] };
+  if (!courses || !courses.length) return { totalRemoved: 0, totalRenamed: 0, details: [] };
 
   let totalRemoved = 0;
-  const removedDetails = [];
+  let totalRenamed = 0;
+  const details = [];
 
   for (const c of courses) {
     const [groupsRes, studentsRes] = await Promise.all([
       db.prepare('SELECT id, name, seq FROM groups WHERE course_id = ? ORDER BY seq ASC').bind(c.id).all(),
-      db.prepare('SELECT id, group_id FROM students WHERE course_id = ?').bind(c.id).all(),
+      db.prepare('SELECT id, group_id, is_leader FROM students WHERE course_id = ?').bind(c.id).all(),
     ]);
     const groups = groupsRes.results || [];
     const students = studentsRes.results || [];
 
     const memberCounts = {};
-    groups.forEach(g => { memberCounts[g.id] = 0; });
+    const leaderCounts = {};
+    groups.forEach(g => {
+      memberCounts[g.id] = 0;
+      leaderCounts[g.id] = 0;
+    });
     students.forEach(s => {
       if (s.group_id && memberCounts[s.group_id] !== undefined) {
         memberCounts[s.group_id]++;
+        if (s.is_leader) leaderCounts[s.group_id]++;
       }
     });
 
@@ -254,40 +263,122 @@ export async function cleanupDuplicateAndEmptyGroups(db, specificCourseId = null
       nameMap.get(g.name).push(g);
     }
 
+    const preservedGroups = [];
+    const toRenameGroups = [];
+
     for (const [name, gList] of nameMap.entries()) {
-      if (gList.length > 1) {
-        // 同名重複組別：只刪除沒有成員的副本；凡是有成員的組別一律保留
-        const withoutMembers = gList.filter(g => memberCounts[g.id] === 0);
-        withoutMembers.forEach(g => toDeleteIds.add(g.id));
-      } else {
-        // 單一組別：若完全沒有成員，視為遺缺或無人空組別予以清理
+      if (gList.length === 1) {
         const g = gList[0];
         if (memberCounts[g.id] === 0) {
           toDeleteIds.add(g.id);
+        } else {
+          preservedGroups.push(g);
+        }
+      } else {
+        // 重複同名組別
+        const withLeader = gList.filter(g => leaderCounts[g.id] > 0);
+        const withMembersNoLeader = gList.filter(g => leaderCounts[g.id] === 0 && memberCounts[g.id] > 0);
+        const empty = gList.filter(g => memberCounts[g.id] === 0);
+
+        // 無成員之重複副本一律直接刪除
+        empty.forEach(g => toDeleteIds.add(g.id));
+
+        if (withLeader.length > 0) {
+          // 有組長之組別優先保留原名（由學生自行組建之組別）
+          preservedGroups.push(withLeader[0]);
+          for (let i = 1; i < withLeader.length; i++) {
+            preservedGroups.push(withLeader[i]);
+          }
+          // 其餘無組長但有成員之重複組別（先前系統分配產生的衝突組），重新命名填補缺號
+          withMembersNoLeader.forEach(g => toRenameGroups.push(g));
+        } else if (withMembersNoLeader.length > 0) {
+          // 若重複組皆無組長，保留第一個，其餘重命名填補缺號
+          preservedGroups.push(withMembersNoLeader[0]);
+          for (let i = 1; i < withMembersNoLeader.length; i++) {
+            toRenameGroups.push(withMembersNoLeader[i]);
+          }
         }
       }
     }
 
+    const stmts = [];
+    // 刪除空組別
     const idsArray = Array.from(toDeleteIds);
     if (idsArray.length > 0) {
-      const delStmts = [];
       for (const gid of idsArray) {
-        delStmts.push(db.prepare('DELETE FROM groups WHERE course_id = ? AND id = ?').bind(c.id, gid));
-        delStmts.push(db.prepare('DELETE FROM attendance_unlocks WHERE course_id = ? AND group_id = ?').bind(c.id, gid));
-        delStmts.push(db.prepare('DELETE FROM attendance_delegates WHERE course_id = ? AND group_id = ?').bind(c.id, gid));
-      }
-      for (let i = 0; i < delStmts.length; i += 50) {
-        await db.batch(delStmts.slice(i, i + 50));
+        stmts.push(db.prepare('DELETE FROM groups WHERE course_id = ? AND id = ?').bind(c.id, gid));
+        stmts.push(db.prepare('DELETE FROM attendance_unlocks WHERE course_id = ? AND group_id = ?').bind(c.id, gid));
+        stmts.push(db.prepare('DELETE FROM attendance_delegates WHERE course_id = ? AND group_id = ?').bind(c.id, gid));
       }
       totalRemoved += idsArray.length;
-      removedDetails.push({ courseId: c.id, count: idsArray.length });
+    }
+
+    // 針對需重新命名的重複組別，計算可用的空缺編號並更新
+    if (toRenameGroups.length > 0) {
+      const availableNums = getNextAvailableGroupNumbers(preservedGroups, toRenameGroups.length);
+      toRenameGroups.forEach((g, idx) => {
+        const newName = `第 ${availableNums[idx]} 組`;
+        stmts.push(db.prepare('UPDATE groups SET name = ? WHERE course_id = ? AND id = ?').bind(newName, c.id, g.id));
+        g.name = newName;
+        preservedGroups.push(g);
+        totalRenamed++;
+      });
+    }
+
+    if (stmts.length > 0) {
+      for (let i = 0; i < stmts.length; i += 50) {
+        await db.batch(stmts.slice(i, i + 50));
+      }
+      details.push({ courseId: c.id, removed: idsArray.length, renamed: toRenameGroups.length });
     }
   }
 
-  if (totalRemoved > 0) {
+  if (totalRemoved > 0 || totalRenamed > 0) {
     invalidateStateCache();
   }
-  return { totalRemoved, removedDetails };
+  return { totalRemoved, totalRenamed, details };
+}
+
+/**
+ * 全體組號平滑緊縮連續化（1 ~ N）：
+ * 將現有組別依自然順序重新命名為第 1 組、第 2 組 ... 第 N 組，消除因中途刪組留下的大號缺漏。
+ */
+export async function renumberGroupsSequentially(db, courseId) {
+  const [groupsRes] = await Promise.all([
+    db.prepare('SELECT id, name, seq FROM groups WHERE course_id = ? ORDER BY seq ASC').bind(courseId).all(),
+  ]);
+  const groups = groupsRes.results || [];
+  if (!groups.length) return { updated: 0 };
+
+  // 自然排序
+  groups.sort((a, b) => {
+    const na = parseGroupNumber(a.name);
+    const nb = parseGroupNumber(b.name);
+    if (na !== null && nb !== null) return na - nb;
+    if (na !== null) return -1;
+    if (nb !== null) return 1;
+    return (a.seq || 0) - (b.seq || 0);
+  });
+
+  const stmts = [];
+  let updated = 0;
+  groups.forEach((g, idx) => {
+    const targetName = `第 ${idx + 1} 組`;
+    const targetSeq = idx + 1;
+    if (g.name !== targetName || g.seq !== targetSeq) {
+      stmts.push(db.prepare('UPDATE groups SET name = ?, seq = ? WHERE course_id = ? AND id = ?')
+        .bind(targetName, targetSeq, courseId, g.id));
+      updated++;
+    }
+  });
+
+  if (stmts.length > 0) {
+    for (let i = 0; i < stmts.length; i += 50) {
+      await db.batch(stmts.slice(i, i + 50));
+    }
+    invalidateStateCache();
+  }
+  return { updated };
 }
 
 /* ===== 伺服器短暫記憶體快取與快取失效 ===== */
@@ -454,8 +545,24 @@ export async function loadState(db) {
     db.prepare('SELECT * FROM attendance_sessions ORDER BY date DESC, created_at DESC').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM attendance_records').all().catch(() => ({ results: [] })),
     db.prepare('SELECT * FROM attendance_unlocks').all().catch(() => ({ results: [] })),
-    db.prepare('SELECT * FROM attendance_delegates').all().catch(() => ({ results: [] })),
   ]);
+
+  // 自動檢測重複組別：若資料庫內存在同名重複組別，即時自動自癒修復
+  const seenGroupKeys = new Set();
+  let hasDuplicateGroups = false;
+  for (const g of (groups.results || [])) {
+    const k = g.course_id + '::' + g.name;
+    if (seenGroupKeys.has(k)) {
+      hasDuplicateGroups = true;
+      break;
+    }
+    seenGroupKeys.add(k);
+  }
+  if (hasDuplicateGroups) {
+    await cleanupDuplicateAndEmptyGroups(db);
+    groups.results = (await db.prepare('SELECT * FROM groups ORDER BY seq ASC').all()).results || [];
+  }
+
   const snapshotSet = new Set((snapshots.results || []).map(r => r.course_id));
   const result = courses.results.map(c => {
     const courseGroups = groups.results.filter(g => g.course_id === c.id).map(g => ({

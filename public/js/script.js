@@ -1,6 +1,6 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.7.0 (2026.10.05-1103)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.7.0 (2026.10.05-1140)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
@@ -13,7 +13,7 @@ let state = {
   currentId: localStorage.getItem(CURRENT_KEY) || null,
 };
 let loginMode = null;   // 前台登入區：null | 'student' | 'teacher'
-let teacherView = 'course';   // 後台主區：'course' | 'settings' | 'eval' | 'logs'
+let teacherView = 'course';   // 後台主區：'course' | 'coursemgmt' | 'settings' | 'eval' | 'logs'
 let teacherPreviewMode = localStorage.getItem(PREVIEW_KEY) || 'admin';  // 老師預覽模式：'admin' | 'public' | 'leader'
 let teacherSimulatedLeader = localStorage.getItem(SIMULATED_LEADER_KEY) || ''; // 挑選模擬之組別 ID 或組長 ID（預設為空，由邏輯預設第一組）
 let busy = false;
@@ -1663,15 +1663,18 @@ function courseTree() {
           const isSelected = state.currentId === c.id;
           const cached = courseLogsCache && courseLogsCache[c.id];
           return `
-          <li class="${isSelected && (teacherView === 'course' || teacherView === 'attendance' || teacherView === 'logs') ? 'active' : ''}">
+          <li class="${isSelected && (teacherView === 'course' || teacherView === 'coursemgmt' || teacherView === 'attendance' || teacherView === 'logs') ? 'active' : ''}">
             <button data-act="pick-course-node" data-id="${c.id}" class="tree-course-main-btn">
               ${esc(c.subject || '（未命名科目）')}
               <span class="count">${c.students.length} 人 / ${c.groups.length} 組</span>
             </button>
             ${isSelected ? `
               <div class="tree-sub-links">
-                <button class="tree-sub-btn ${teacherView === 'course' ? 'on' : ''}" data-act="goto-course-setup" data-id="${c.id}" title="進入課程與分組管理">
-                  <span>⚙️ 課程與分組</span>
+                <button class="tree-sub-btn ${teacherView === 'coursemgmt' ? 'on' : ''}" data-act="goto-course-mgmt" data-id="${c.id}" title="課程設定與刪除">
+                  <span>⚙️ 課程管理</span>
+                </button>
+                <button class="tree-sub-btn ${teacherView === 'course' ? 'on' : ''}" data-act="goto-course-setup" data-id="${c.id}" title="進入分組管理">
+                  <span>👥 分組管理</span>
                 </button>
                 <button class="tree-sub-btn ${teacherView === 'attendance' ? 'on' : ''}" data-act="goto-course-attendance" data-id="${c.id}" title="點名時段與出勤監控">
                   <span>📝 點名管理</span>
@@ -1723,6 +1726,8 @@ function teacherScreen() {
     main = teacherLogsScreen(c);
   } else if (teacherView === 'attendance') {
     main = teacherAttendanceDashboard(c);
+  } else if (teacherView === 'coursemgmt' && c) {
+    main = teacherCourseMgmt(c);
   } else {
     main = c ? teacherCourse(c) : teacherNoCourse();
   }
@@ -1745,7 +1750,7 @@ function teacherLogsScreen(c) {
     </div>
     <div style="display:flex;gap:0.5rem;align-items:center;">
       <button class="btn btn-secondary" data-act="goto-course-setup" data-id="${c.id}" style="margin:0;padding:0.45rem 1rem;font-size:0.88rem;">
-        ⚙️ 前往課程與分組管理
+        ⚙️ 前往分組管理
       </button>
     </div>
   </div>
@@ -2025,21 +2030,21 @@ function filterLogRows() {
   }
 }
 
+function teacherCourseMgmt(c) {
+  return `
+  <div class="teacher-section">
+    <h2>課程管理 Course management <small>${esc(courseLabel(c))}</small></h2>
+    ${courseForm(c)}
+    <div class="btn-row" style="margin-top:1rem">
+      <button class="btn btn-danger" data-act="del-course" data-id="${c.id}" title="完全刪除本科目所有資料">刪除整個科目（含名單與分組）Delete course</button>
+    </div>
+  </div>`;
+}
+
 function teacherCourse(c) {
   const total = c.students.length;
   const assigned = c.students.filter(s => s.groupId).length;
   return `
-  <div class="teacher-section">
-    <h2>課程設定 Course setup <small>${esc(courseLabel(c))}</small></h2>
-    ${courseForm(c)}
-    <div class="btn-row" style="margin-top:1rem">
-      <button class="btn btn-warning" data-act="clear-groups" title="只清除所有組別與學生組別分配，保留修課名單與課程">刪除分組（不刪名單與課程）Delete groups only</button>
-      ${c.hasSnapshot ? `
-        <button class="btn btn-undo" data-act="restore-snapshot" title="復原至上次清空或建立組別前的分組狀態">↩️ 回到上一步 (復原分組) Undo</button>
-      ` : ''}
-      <button class="btn btn-danger" data-act="del-course" data-id="${c.id}" title="完全刪除本科目所有資料">刪除整個科目（含名單與分組）Delete course</button>
-    </div>
-  </div>
 
   ${bulletinAdminBlock(c)}
 
@@ -2863,6 +2868,12 @@ app.addEventListener('click', e => {
     localStorage.setItem(CURRENT_KEY, state.currentId);
     return render();
   }
+  if (a === 'goto-course-mgmt') {
+    if (id) state.currentId = id;
+    teacherView = 'coursemgmt';
+    localStorage.setItem(CURRENT_KEY, state.currentId);
+    return render();
+  }
   if (a === 'goto-course-attendance') {
     if (id) state.currentId = id;
     teacherView = 'attendance';
@@ -2878,7 +2889,7 @@ app.addEventListener('click', e => {
   }
   if (a === 'pick-course-node' || a === 'pick-course') {
     state.currentId = id || btn.value;
-    if (teacherView !== 'eval' && teacherView !== 'logs' && teacherView !== 'attendance') {
+    if (teacherView !== 'eval' && teacherView !== 'logs' && teacherView !== 'attendance' && teacherView !== 'coursemgmt') {
       teacherView = 'course';
     } else if (teacherView === 'logs') {
       loadLogsForCourse(state.currentId);

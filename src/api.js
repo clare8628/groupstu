@@ -1,4 +1,4 @@
-export const API_VERSION = 'v2.6.6 (2026.09.22-1512)';
+export const API_VERSION = 'v2.7.0 (2026.10.05-1103)';
 import {
   json, bad, sha256, makeToken, readSession, sessionCookie, clearCookie,
   loadState, cap, minCap, membersOf, deadlinePassed, shuffle, teacherHash, nextSeq,
@@ -491,18 +491,74 @@ export async function handleAction(request, env, db, body) {
     return bad('未知操作 Unknown action: ' + op, 400);
   }
 
-  /* ---- 學生（組長） ---- */
-  if (!session || session.role !== 'student') return bad('請先登入 Sign in first', 401);
-  const c = course(session.courseId);
-  if (!c) return bad('課程不存在', 404);
-  const self = c.students.find(s => s.id === session.id);
-  if (!self) return bad('學生不存在', 404);
+  /* ---- 學生（組長）或老師模擬組長 ---- */
+  const isTeacherSimulating = session && session.role === 'teacher';
+  let c = null;
+  let self = null;
+
+  if (isTeacherSimulating) {
+    const courseId = body.courseId;
+    if (!courseId) return bad('缺少課程 ID Course ID required', 400);
+    c = course(courseId);
+    if (!c) return bad('課程不存在 Course not found', 404);
+
+    const simLeaderId = body.simulatedLeaderId;
+    const simGroupId = body.simulatedGroupId;
+
+    let targetStudent = c.students.find(s => s.id === simLeaderId || s.ref === simLeaderId);
+    let targetGroup = c.groups.find(g => g.id === simGroupId || (targetStudent && g.id === targetStudent.groupId));
+
+    if (!targetGroup && !targetStudent) {
+      // 若沒有特意挑選每一組長，預設選擇為第一組組長
+      const sorted = c.groups.slice().sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0));
+      targetGroup = sorted[0] || null;
+    }
+
+    if (targetStudent) {
+      self = { ...targetStudent, isLeader: true };
+      if (!self.groupId && targetGroup) self.groupId = targetGroup.id;
+    } else if (targetGroup) {
+      const lead = c.students.find(s => s.groupId === targetGroup.id && s.isLeader);
+      if (lead) {
+        self = lead;
+      } else {
+        const member = c.students.find(s => s.groupId === targetGroup.id);
+        if (member) {
+          self = { ...member, isLeader: true };
+        } else {
+          self = {
+            id: 'sim-lead-' + targetGroup.id,
+            name: `${targetGroup.name}組長(模擬)`,
+            isLeader: true,
+            groupId: targetGroup.id,
+            isSimulated: true,
+          };
+        }
+      }
+    } else {
+      const anyLead = c.students.find(s => s.isLeader);
+      if (anyLead) {
+        self = anyLead;
+      } else if (c.students.length) {
+        self = { ...c.students[0], isLeader: true };
+      } else {
+        self = { id: 'sim-lead-default', name: '預覽組長(測試)', isLeader: true, groupId: null, isSimulated: true };
+      }
+    }
+  } else if (session && session.role === 'student') {
+    c = course(session.courseId);
+    if (!c) return bad('課程不存在', 404);
+    self = c.students.find(s => s.id === session.id);
+    if (!self) return bad('學生不存在', 404);
+  } else {
+    return bad('請先登入 Sign in first', 401);
+  }
 
   const myGroup = self.groupId ? c.groups.find(g => g.id === self.groupId) : null;
-  const canEdit = canGroupLeaderEdit(c, myGroup);
+  const canEdit = isTeacherSimulating ? true : canGroupLeaderEdit(c, myGroup);
 
   if (action === 'claim-leader') {
-    if (deadlinePassed(c)) return bad('已超過分組截止時間，無法再登記為組長 Deadline passed', 403);
+    if (!isTeacherSimulating && deadlinePassed(c)) return bad('已超過分組截止時間，無法再登記為組長 Deadline passed', 403);
     let gid = self.groupId;
     let groupName = '';
     if (!gid) {
@@ -523,33 +579,44 @@ export async function handleAction(request, env, db, body) {
       groupName = g ? g.name : '該組';
     }
     if (membersOf(c, gid).some(m => m.isLeader && m.id !== self.id)) return bad('本組已有組長 This group already has a leader', 409);
-    await db.prepare('UPDATE students SET group_id=?, is_leader=1, is_vice=0, auto_assigned=0 WHERE course_id=? AND id=?')
-      .bind(gid, c.id, self.id).run();
-    await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'claim-leader', `登記擔任 ${groupName} 組長`);
+    if (!self.isSimulated) {
+      await db.prepare('UPDATE students SET group_id=?, is_leader=1, is_vice=0, auto_assigned=0 WHERE course_id=? AND id=?')
+        .bind(gid, c.id, self.id).run();
+    }
+    const opName = isTeacherSimulating ? `老師（模擬組長 ${self.name}）` : `組長 ${self.name} (${self.id})`;
+    await addLog(db, c.id, opName, 'claim-leader', `登記擔任 ${groupName} 組長`);
     return ok();
   }
   if (action === 'unclaim-leader') {
     if (!canEdit) return bad('已超過分組截止時間，無法取消組長身分 Deadline passed', 403);
     const vice = membersOf(c, self.groupId).find(m => m.isVice && m.id !== self.id);
     const groupName = myGroup ? myGroup.name : '該組';
+    const opName = isTeacherSimulating ? `老師（模擬組長 ${self.name}）` : `組長 ${self.name} (${self.id})`;
     if (vice) {
       // 副組長自動晉級組長，原組長退為一般組員
-      await db.batch([
-        db.prepare('UPDATE students SET is_leader=0 WHERE course_id=? AND id=?').bind(c.id, self.id),
-        db.prepare('UPDATE students SET is_leader=1, is_vice=0 WHERE course_id=? AND id=?').bind(c.id, vice.id),
-      ]);
-      await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'unclaim-leader', `取消 ${groupName} 組長身分，由副組長 ${vice.name} (${vice.id}) 晉任為組長`);
+      const stmts = [
+        db.prepare('UPDATE students SET is_leader=1, is_vice=0 WHERE course_id=? AND id=?').bind(c.id, vice.id)
+      ];
+      if (!self.isSimulated) {
+        stmts.unshift(db.prepare('UPDATE students SET is_leader=0 WHERE course_id=? AND id=?').bind(c.id, self.id));
+      }
+      await db.batch(stmts);
+      await addLog(db, c.id, opName, 'unclaim-leader', `取消 ${groupName} 組長身分，由副組長 ${vice.name} (${vice.id}) 晉任為組長`);
     } else {
-      await db.prepare('UPDATE students SET is_leader=0 WHERE course_id=? AND id=?').bind(c.id, self.id).run();
-      await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'unclaim-leader', `取消 ${groupName} 組長身分，退回為一般組員`);
+      if (!self.isSimulated) {
+        await db.prepare('UPDATE students SET is_leader=0 WHERE course_id=? AND id=?').bind(c.id, self.id).run();
+      }
+      await addLog(db, c.id, opName, 'unclaim-leader', `取消 ${groupName} 組長身分，退回為一般組員`);
     }
     return ok();
   }
   if (action === 'submit-peer-eval') {
     if (!self.isLeader) return bad('僅組長可進行評分 Leader only', 403);
     if (!myGroup) return bad('尚未加入組別', 400);
-    if (!myGroup.peerEvalOpen) return bad('老師尚未開放本組組長評分權限 Peer evaluation is not open', 403);
-    if (evalDeadlinePassed(myGroup)) return bad('組長評分截止時間已過，無法再提交評分 Deadline passed', 403);
+    if (!isTeacherSimulating) {
+      if (!myGroup.peerEvalOpen) return bad('老師尚未開放本組組長評分權限 Peer evaluation is not open', 403);
+      if (evalDeadlinePassed(myGroup)) return bad('組長評分截止時間已過，無法再提交評分 Deadline passed', 403);
+    }
 
     const evaluations = Array.isArray(body.evaluations) ? body.evaluations : [];
     const stmts = [];
@@ -566,7 +633,8 @@ export async function handleAction(request, env, db, body) {
       .bind(c.id, self.groupId));
     if (stmts.length) await db.batch(stmts);
     const groupName = myGroup ? myGroup.name : '本組';
-    await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'submit-peer-eval', `提交了 ${groupName} 的期末互評成績（共評定 ${evaluations.length} 位組員）`);
+    const opName = isTeacherSimulating ? `老師（模擬 ${groupName} 組長 ${self.name}）` : `組長 ${self.name} (${self.id})`;
+    await addLog(db, c.id, opName, 'submit-peer-eval', `提交了 ${groupName} 的期末互評成績（共評定 ${evaluations.length} 位組員）`);
     return ok();
   }
   if (!self.isLeader) return bad('僅組長可操作 Leader only', 403);
@@ -580,7 +648,8 @@ export async function handleAction(request, env, db, body) {
     await db.prepare('UPDATE students SET group_id=?, auto_assigned=0 WHERE course_id=? AND id=?')
       .bind(self.groupId, c.id, t.id).run();
     const groupName = myGroup ? myGroup.name : '本組';
-    await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'pick', `將組員 ${t.name} (${t.id}) 加入 ${groupName}`);
+    const opName = isTeacherSimulating ? `老師（模擬 ${groupName} 組長 ${self.name}）` : `組長 ${self.name} (${self.id})`;
+    await addLog(db, c.id, opName, 'pick', `將組員 ${t.name} (${t.id}) 加入 ${groupName}`);
     return ok();
   }
   if (action === 'drop') {
@@ -589,7 +658,8 @@ export async function handleAction(request, env, db, body) {
     await db.prepare('UPDATE students SET group_id=NULL, is_vice=0, auto_assigned=0 WHERE course_id=? AND id=?')
       .bind(c.id, t.id).run();
     const groupName = myGroup ? myGroup.name : '本組';
-    await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'drop', `將組員 ${t.name} (${t.id}) 從 ${groupName} 釋出`);
+    const opName = isTeacherSimulating ? `老師（模擬 ${groupName} 組長 ${self.name}）` : `組長 ${self.name} (${self.id})`;
+    await addLog(db, c.id, opName, 'drop', `將組員 ${t.name} (${t.id}) 從 ${groupName} 釋出`);
     return ok();
   }
   if (action === 'toggle-vice') {
@@ -601,19 +671,23 @@ export async function handleAction(request, env, db, body) {
       db.prepare('UPDATE students SET is_vice=? WHERE course_id=? AND id=?').bind(on, c.id, t.id),
     ]);
     const groupName = myGroup ? myGroup.name : '本組';
-    await addLog(db, c.id, `組長 ${self.name} (${self.id})`, 'toggle-vice', `將組員 ${t.name} (${t.id}) ${on ? '指定為' : '解除'} ${groupName} 副組長`);
+    const opName = isTeacherSimulating ? `老師（模擬 ${groupName} 組長 ${self.name}）` : `組長 ${self.name} (${self.id})`;
+    await addLog(db, c.id, opName, 'toggle-vice', `將組員 ${t.name} (${t.id}) ${on ? '指定為' : '解除'} ${groupName} 副組長`);
     return ok();
   }
   if (action === 'change-student-password') {
+    if (isTeacherSimulating && self.isSimulated) return ok();
     if (!self.isLeader && !self.isVice) return bad('僅組長或副組長可修改個人密碼 Leader or vice leader only', 403);
     const curPw = String(body.current || '');
     const nextPw = String(body.next || '');
     if (nextPw.length < 4) return bad('新密碼長度至少需 4 碼 Password at least 4 chars', 400);
 
-    if (self.passwordHash) {
-      if (await sha256(curPw) !== self.passwordHash) return bad('目前密碼錯誤 Incorrect current password', 401);
-    } else {
-      if (curPw !== self.id) return bad('目前密碼錯誤（預設為學號）Incorrect current password', 401);
+    if (!isTeacherSimulating) {
+      if (self.passwordHash) {
+        if (await sha256(curPw) !== self.passwordHash) return bad('目前密碼錯誤 Incorrect current password', 401);
+      } else {
+        if (curPw !== self.id) return bad('目前密碼錯誤（預設為學號）Incorrect current password', 401);
+      }
     }
 
     const newHash = await sha256(nextPw);
@@ -621,7 +695,8 @@ export async function handleAction(request, env, db, body) {
       .bind(newHash, c.id, self.id).run();
     invalidateStateCache();
     const roleLabel = self.isLeader ? '組長' : '副組長';
-    await addLog(db, c.id, `${roleLabel} ${self.name} (${self.id})`, 'change-password', `${roleLabel} 自行更新了登入密碼`);
+    const opName = isTeacherSimulating ? `老師（代${roleLabel} ${self.name}）` : `${roleLabel} ${self.name} (${self.id})`;
+    await addLog(db, c.id, opName, 'change-password', `${roleLabel} 自行更新了登入密碼`);
     return ok();
   }
 
@@ -632,12 +707,12 @@ export async function handleAction(request, env, db, body) {
     const now = Date.now();
     const today = todayDateStr();
 
-    // 1. 驗證身分：操作者必須為組長、副組長，或被指派跨組代理
+    // 1. 驗證身分：操作者必須為組長、副組長，或被指派跨組代理，或老師模擬中
     let isDelegate = (c.attendanceDelegates || []).some(d =>
       d.sessionId === sessionId && d.groupId === groupId && d.delegateId === self.id
     );
 
-    if (!isDelegate) {
+    if (!isDelegate && !isTeacherSimulating) {
       if (self.groupId !== groupId) return bad('您非該組成員，且未獲授權代理該組點名 Not authorized for this group', 403);
       if (!self.isLeader && !self.isVice) return bad('僅組長或副組長可執行點名 Leader or vice leader only', 403);
     }
@@ -659,7 +734,7 @@ export async function handleAction(request, env, db, body) {
     if (!sessionObj) return bad('點名時段不存在 Session not found', 404);
 
     // 3. 檢查時效性與補登解鎖
-    if (!isDelegate) {
+    if (!isDelegate && !isTeacherSimulating) {
       if (!isAttendanceEditable(sessionObj, c.attendanceUnlocks || [], groupId)) {
         return bad('已超過當日，點名紀錄已鎖定，需老師開放補登權限 Locked, ask teacher to unlock', 403);
       }
@@ -680,8 +755,9 @@ export async function handleAction(request, env, db, body) {
     });
 
     const stmts = [];
-    const roleLabel = self.isLeader ? '組長' : (self.isVice ? '副組長' : '代理人');
+    const roleLabel = isTeacherSimulating ? `老師（模擬組長 ${self.name}）` : (self.isLeader ? '組長' : (self.isVice ? '副組長' : '代理人'));
     const delegateNote = isDelegate ? '（跨組代理）' : '';
+    const markedByName = isTeacherSimulating ? `老師（代${self.name}）` : self.name;
 
     for (const rec of records) {
       const student = c.students.find(x => x.id === rec.studentId || x.ref === rec.studentId);
@@ -696,7 +772,7 @@ export async function handleAction(request, env, db, body) {
           INSERT OR REPLACE INTO attendance_records
           (course_id, session_id, student_id, group_id, status, marked_by_id, marked_by_name, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(c.id, sessionObj.id, student.id, groupId, status, self.id, self.name, createdAt, now)
+        `).bind(c.id, sessionObj.id, student.id, groupId, status, self.id, markedByName, createdAt, now)
       );
 
       // 異動日誌

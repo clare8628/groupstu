@@ -1,9 +1,10 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.6.6 (2026.09.22-1512)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.7.0 (2026.10.05-1103)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
+const SIMULATED_LEADER_KEY = 'groupstu_teacher_simulated_leader'; // 記住老師挑選模擬之組別或組長
 const POLL_MS = 15000;   // 輪詢延長為 15 秒，降低 D1 消耗
 
 let state = {
@@ -14,6 +15,7 @@ let state = {
 let loginMode = null;   // 前台登入區：null | 'student' | 'teacher'
 let teacherView = 'course';   // 後台主區：'course' | 'settings' | 'eval' | 'logs'
 let teacherPreviewMode = localStorage.getItem(PREVIEW_KEY) || 'admin';  // 老師預覽模式：'admin' | 'public' | 'leader'
+let teacherSimulatedLeader = localStorage.getItem(SIMULATED_LEADER_KEY) || ''; // 挑選模擬之組別 ID 或組長 ID（預設為空，由邏輯預設第一組）
 let busy = false;
 let lastSig = '';
 let courseLogsCache = {};   // 依課程快取異動日誌：{ [courseId]: logsArray }
@@ -75,6 +77,16 @@ async function act(action, payload = {}, opts = {}) {
   if (busy) return null;
   busy = true;
   try {
+    // 若老師處於組長預覽模式，自動注入當前課程與模擬之組長/組別參數
+    if (state.session && state.session.role === 'teacher' && teacherPreviewMode === 'leader') {
+      const c = cur();
+      const s = me();
+      if (c && !payload.courseId) payload.courseId = c.id;
+      if (s) {
+        if (!payload.simulatedLeaderId) payload.simulatedLeaderId = s.id;
+        if (!payload.simulatedGroupId) payload.simulatedGroupId = s.groupId;
+      }
+    }
     const data = await apiPost(action, payload);
     apply(data);
     if (opts.after) opts.after(data);
@@ -121,18 +133,85 @@ const unassigned = c => c.students.filter(s => !s.groupId);
 const findStudent = (c, id) => c.students.find(s => s.id === id || s.ref === id);
 const keyOf = s => s.ref || s.id;   // 送給後端的識別碼
 const leaderOf = (c, gid) => members(c, gid).find(s => s.isLeader);
+/* 取得老師模擬的組長或組別成員（若沒有特意挑選，預設選擇第一組組長） */
+function getSimulatedLeader(c) {
+  if (!c) return null;
+  const sortedGroups = (c.groups || []).slice().sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0));
+
+  // 1. 若老師已特意指定某組或某組長
+  if (teacherSimulatedLeader) {
+    // 檢查是否符合指定之組別 ID (groupId)
+    const targetGroup = sortedGroups.find(g => g.id === teacherSimulatedLeader);
+    if (targetGroup) {
+      const lead = leaderOf(c, targetGroup.id);
+      if (lead) return { ...lead, groupId: targetGroup.id };
+      const gMates = members(c, targetGroup.id);
+      if (gMates.length) return { ...gMates[0], isLeader: true, groupId: targetGroup.id };
+      return { id: 'sim-lead-' + targetGroup.id, name: `${targetGroup.name}組長(模擬)`, isLeader: true, groupId: targetGroup.id, isSimulated: true };
+    }
+
+    // 檢查是否符合指定之學生 ID (studentId)
+    const targetStudent = (c.students || []).find(s => s.id === teacherSimulatedLeader || s.ref === teacherSimulatedLeader);
+    if (targetStudent) {
+      const gid = targetStudent.groupId || (sortedGroups[0] ? sortedGroups[0].id : null);
+      return { ...targetStudent, isLeader: true, groupId: gid };
+    }
+  }
+
+  // 2. 若沒有特意挑選每一組長，預設選擇為「第一組組長」
+  if (sortedGroups.length > 0) {
+    const firstGroup = sortedGroups[0];
+    const firstLead = leaderOf(c, firstGroup.id);
+    if (firstLead) return { ...firstLead, groupId: firstGroup.id };
+    const firstMates = members(c, firstGroup.id);
+    if (firstMates.length) return { ...firstMates[0], isLeader: true, groupId: firstGroup.id };
+    return { id: 'sim-lead-' + firstGroup.id, name: `${firstGroup.name}組長(模擬)`, isLeader: true, groupId: firstGroup.id, isSimulated: true };
+  }
+
+  // 3. 若課程尚無組別，找任一登記為組長之學生或第一位學生
+  const anyLead = (c.students || []).find(s => s.isLeader && s.groupId);
+  if (anyLead) return anyLead;
+  const anyStudent = (c.students || [])[0];
+  if (anyStudent) return { ...anyStudent, isLeader: true, groupId: null };
+  return { id: 'preview-lead', name: '預覽組長(測試)', isLeader: true, groupId: null, isSimulated: true };
+}
+
+/* 產生老師可供挑選模擬之組長下拉選單選項 HTML */
+function simulatedLeaderOptions(c) {
+  if (!c || !c.groups || !c.groups.length) {
+    return '<option value="">（目前尚無組別可供挑選）</option>';
+  }
+  const sortedGroups = c.groups.slice().sort((a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0));
+  const currentLeader = getSimulatedLeader(c);
+  const currentGroupId = currentLeader ? currentLeader.groupId : null;
+
+  return sortedGroups.map((g, idx) => {
+    const lead = leaderOf(c, g.id);
+    const count = members(c, g.id).length;
+    let label = `${g.name}：`;
+    if (lead) {
+      label += `組長 ${lead.name} (${lead.id}) [${count}人]`;
+    } else if (count > 0) {
+      label += `（暫無組長，以組員身分模擬）[${count}人]`;
+    } else {
+      label += `（空組別，${count}人）`;
+    }
+    if (idx === 0) {
+      label += ' ★預設第一組';
+    }
+
+    const isSelected = (currentGroupId && currentGroupId === g.id) || (!teacherSimulatedLeader && idx === 0);
+    return `<option value="${esc(g.id)}" ${isSelected ? 'selected' : ''}>${esc(label)}</option>`;
+  }).join('');
+}
+
 function me() {
   const c = cur();
   if (!c) return null;
   if (state.session && state.session.role === 'student') return findStudent(c, state.session.id);
-  // 若老師處於組長預覽模式，模擬當前課程的第一位組長或成員
+  // 若老師處於組長預覽模式，模擬當前挑選之組長（預設第一組組長）
   if (state.session && state.session.role === 'teacher' && teacherPreviewMode === 'leader') {
-    const lead = c.students.find(s => s.isLeader && s.groupId);
-    if (lead) return lead;
-    // 若尚未有組長，則找任一有組別的學生或第一位學生模擬
-    const anyStudent = c.students.find(s => s.groupId) || c.students[0];
-    if (anyStudent) return { ...anyStudent, isLeader: true };
-    return { id: 'preview-lead', name: '預覽組長(測試)', isLeader: true, groupId: c.groups[0]?.id || null };
+    return getSimulatedLeader(c);
   }
   return null;
 }
@@ -1304,6 +1383,9 @@ function publicBoard({ withUnassigned = true } = {}) {
             <button class="tab-btn ${g.allowEdit ? 'on' : ''}" data-act="toggle-group-edit" data-id="${g.id}" data-allow="${g.allowEdit ? '0' : '1'}">
               ${g.allowEdit ? '🔒 取消開放挑選' : '🔓 重新開放組長挑選'}
             </button>
+            <button class="btn btn-secondary simulate-group-btn" data-act="simulate-group-leader" data-id="${g.id}" title="以該組組長身分檢視並操作挑選、點名或期末評分">
+              🎓 模擬此組組長
+            </button>
             ${g.allowEdit && g.editDeadline ? `<span style="font-size:0.75rem;color:#d97706;margin-top:0.25rem;display:block;">截止: ${esc(g.editDeadline.replace('T', ' '))}</span>` : ''}
           </div>` : ''}
       </div>`;
@@ -2234,16 +2316,42 @@ function rosterTable(c) {
 
 function studentScreen() {
   const c = cur(), s = me();
-  if (!c || !s) { state.session = null; return authScreen(); }
+  const isPreview = state.session && state.session.role === 'teacher';
+  if (!c || !s) {
+    if (isPreview) {
+      return `<div class="student-section"><p class="file-path">目前此課程尚無可模擬之組別或組長，請先在後台建立組別或匯入學生名單。</p></div>` + publicBoard();
+    }
+    state.session = null;
+    return authScreen();
+  }
   const g = c.groups.find(x => x.id === s.groupId);
   const mates = g ? members(c, g.id) : [];
   const closed = deadlinePassed(c);
   const canEdit = canGroupLeaderEdit(c, g);
   const otherLeader = g ? mates.find(m => m.isLeader && m.id !== s.id) : null;
-  const isPreview = state.session && state.session.role === 'teacher';
 
   let html = `
   <div class="student-section">
+    ${isPreview ? `
+    <div class="teacher-leader-simulation-card">
+      <div class="simulation-header">
+        <div class="simulation-title-wrap">
+          <span class="simulation-badge">🎓 老師模擬組長模式</span>
+          <span class="simulation-current-info">
+            目前模擬：<b>【${g ? esc(g.name) : '未指定組別'}】組長（${esc(s.name)}）</b>
+          </span>
+        </div>
+        <div class="simulation-select-wrap">
+          <label for="student-sim-select">挑選組長：</label>
+          <select id="student-sim-select" class="sim-leader-select" data-act="change-simulated-leader">
+            ${simulatedLeaderOptions(c)}
+          </select>
+        </div>
+      </div>
+      <div class="simulation-note">
+        💡 提示：若未特意挑選組長，預設為第一組組長。在此視角下您可代為挑選或釋出組員、指定副組長、登記點名及評定期末互評。
+      </div>
+    </div>` : ''}
     <h2>${esc(courseLabel(c))}</h2>
     <div class="student-info">
       <strong>學生 Student:</strong> ${esc(s.name)} (${esc(s.id)})<br>
@@ -2450,6 +2558,13 @@ function teacherPreviewBanner() {
         目前為<b>【${isLeader ? '擔任組長之學生登入' : '一般學生看到的前台'}】</b>視角預覽模式
         ${c ? `（課程：${esc(courseLabel(c))}）` : ''}
       </span>
+      ${isLeader && c ? `
+        <div class="preview-picker-inline">
+          <label>挑選組長：</label>
+          <select class="sim-leader-select-nav" data-act="change-simulated-leader">
+            ${simulatedLeaderOptions(c)}
+          </select>
+        </div>` : ''}
     </div>
     <div class="preview-bar-right">
       <button class="btn btn-secondary" data-act="switch-preview" data-mode="${isLeader ? 'public' : 'leader'}" style="padding:0.35rem 0.8rem;font-size:0.85rem;margin:0;">
@@ -2708,13 +2823,26 @@ app.addEventListener('click', e => {
     localStorage.setItem(PREVIEW_KEY, teacherPreviewMode);
     return render();
   }
+  if (a === 'simulate-group-leader') {
+    teacherSimulatedLeader = id || '';
+    if (teacherSimulatedLeader) {
+      localStorage.setItem(SIMULATED_LEADER_KEY, teacherSimulatedLeader);
+    } else {
+      localStorage.removeItem(SIMULATED_LEADER_KEY);
+    }
+    teacherPreviewMode = 'leader';
+    localStorage.setItem(PREVIEW_KEY, 'leader');
+    return render();
+  }
   if (a === 'logout') {
     return act('logout', {}, {
       after: () => {
         loginMode = null;
         teacherView = 'course';
         teacherPreviewMode = 'admin';
+        teacherSimulatedLeader = '';
         localStorage.removeItem(PREVIEW_KEY);
+        localStorage.removeItem(SIMULATED_LEADER_KEY);
       }
     });
   }
@@ -3094,6 +3222,17 @@ app.addEventListener('change', e => {
   if (!a) return;
   const id = t.dataset.id;
   const c = cur();
+
+  // 老師切換模擬之組別組長
+  if (a === 'change-simulated-leader') {
+    teacherSimulatedLeader = t.value || '';
+    if (teacherSimulatedLeader) {
+      localStorage.setItem(SIMULATED_LEADER_KEY, teacherSimulatedLeader);
+    } else {
+      localStorage.removeItem(SIMULATED_LEADER_KEY);
+    }
+    return render();
+  }
 
   // 老師針對指定組別開放補登
   if (a === 'teacher-unlock-group-select') {

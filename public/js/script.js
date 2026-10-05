@@ -1,6 +1,6 @@
 /* 學生分組程式 Student Grouping — 單頁前端，狀態存於 localStorage */
 const APP_NAME = '學生分組系統';
-const APP_VERSION = 'v2.7.0 (2026.10.05-1140)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
+const APP_VERSION = 'v2.7.0 (2026.10.05-1202)';   // 顯示於前台標題列（v2 = Cloudflare D1 共用資料）
 
 const CURRENT_KEY = 'groupstu_current_course';   // 僅記住「目前檢視哪一門課」，其餘資料都在伺服器
 const PREVIEW_KEY = 'groupstu_teacher_preview_mode'; // 記住老師切換之視角模式，重新整理不遺失
@@ -2038,15 +2038,15 @@ function teacherCourseMgmt(c) {
     <div class="btn-row" style="margin-top:1rem">
       <button class="btn btn-danger" data-act="del-course" data-id="${c.id}" title="完全刪除本科目所有資料">刪除整個科目（含名單與分組）Delete course</button>
     </div>
-  </div>`;
+  </div>
+
+  ${bulletinAdminBlock(c)}`;
 }
 
 function teacherCourse(c) {
   const total = c.students.length;
   const assigned = c.students.filter(s => s.groupId).length;
   return `
-
-  ${bulletinAdminBlock(c)}
 
   <div class="teacher-section">
     <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;margin-bottom:1rem;">
@@ -2583,7 +2583,38 @@ function teacherPreviewBanner() {
 }
 
 /* ===== Render ===== */
+/* ===== 網址路由：#/<view>[/<courseId>]，重新整理與上一頁皆可還原老師後台頁面 ===== */
+const TEACHER_VIEWS = ['course', 'coursemgmt', 'attendance', 'logs', 'eval', 'settings'];
+const COURSE_VIEWS = ['course', 'coursemgmt', 'attendance', 'logs'];
+
+function hashFromState() {
+  const withCourse = COURSE_VIEWS.includes(teacherView) && state.currentId;
+  return '#/' + teacherView + (withCourse ? '/' + encodeURIComponent(state.currentId) : '');
+}
+
+function applyHash() {
+  if (!(state.session && state.session.role === 'teacher')) return;
+  const [view, id] = location.hash.replace(/^#\/?/, '').split('/');
+  if (!TEACHER_VIEWS.includes(view)) return;
+  teacherView = view;
+  const cid = id ? decodeURIComponent(id) : '';
+  if (cid && state.courses.some(c => c.id === cid)) {
+    state.currentId = cid;
+    localStorage.setItem(CURRENT_KEY, cid);
+  }
+  if (view === 'logs' && state.currentId) loadLogsForCourse(state.currentId);
+}
+
+function syncHash() {
+  if (!(state.session && state.session.role === 'teacher') || teacherPreviewMode !== 'admin') return;
+  const h = hashFromState();
+  if (location.hash !== h) history.pushState(null, '', h);
+}
+
+window.addEventListener('hashchange', () => { applyHash(); render(); });
+
 function render() {
+  syncHash();
   const isTeacher = state.session && state.session.role === 'teacher';
   const isStudent = state.session && state.session.role === 'student';
 
@@ -3337,6 +3368,7 @@ app.addEventListener('change', e => {
        <p class="file-path">${String(err.message)}　請重新整理頁面。</p></div></div>`;
     return;
   }
+  applyHash();
   render();
   setInterval(poll, POLL_MS);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
